@@ -142,6 +142,16 @@ including exactly 3,200 static `icat` image pixels, hyperlinks, mouse input,
 copy/paste, and resizing. The dedicated graphics GUI test checks real animation,
 Unicode placeholder pixels, and relative images.
 
+Default `kitten icat` GIF playback is also checked after the client exits:
+
+```sh
+python3 tests/gui_icat_animation.py
+```
+
+This generates a deterministic animation with partial-frame changes, or accepts
+an explicit image path. Like the other GUI tests, it controls compositor effects
+only for its own window and restores the previous focus afterward.
+
 Performance checks preserve a direct path for ordinary VT/CSI output. In the
 same 171×44 GUI, a paired 100-repetition randomized CSI run measured 158.6 MiB/s
 before and 154.1 MiB/s afterward (about 2.8% lower). Reports are in

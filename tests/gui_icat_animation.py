@@ -6,9 +6,9 @@ import subprocess
 import tempfile
 import time
 
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageDraw
 
-from gui_smoke import ROOT, dispatch, find_client, run, wait_for
+from gui_smoke import ROOT, dispatch, find_client, run, set_window_property, wait_for
 
 
 PROBE = r"""
@@ -30,9 +30,18 @@ while True:
 """
 
 
+def generate_animation(path):
+    frames = []
+    for index in range(24):
+        frame = Image.new("RGB", (320, 180), (20, 30, 40))
+        ImageDraw.Draw(frame).rectangle((index * 10, 60, index * 10 + 25, 90), fill=(255, 80, 30))
+        frames.append(frame)
+    frames[0].save(path, save_all=True, append_images=frames[1:], duration=80, loop=0)
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("image", type=Path)
+    parser.add_argument("image", type=Path, nargs="?")
     parser.add_argument("--binary", type=Path, default=ROOT / "target/release/wisp")
     parser.add_argument("--artifacts", type=Path, default=ROOT / "target/gui-icat-animation")
     options = parser.parse_args()
@@ -42,19 +51,30 @@ def main():
     try:
         with tempfile.TemporaryDirectory(prefix="wisp-icat-animation-") as temporary:
             directory = Path(temporary)
+            image = options.image.resolve() if options.image else directory / "animated-delta.gif"
+            if options.image is None:
+                generate_animation(image)
             config = directory / "config.toml"
             config.write_text('[window]\nmargin_width=0\n[cursor]\nblink=false\n')
             with (options.artifacts / "icat.log").open("w") as log:
                 process = subprocess.Popen([
                     str(options.binary.resolve()), "--config", str(config), "-e",
-                    "python3", "-u", "-c", PROBE, str(directory), str(options.image.resolve()),
+                    "python3", "-u", "-c", PROBE, str(directory), str(image),
                 ], stdout=log, stderr=log)
                 client = wait_for(lambda: find_client(process.pid), "icat window")
                 address = "address:" + client["address"]
                 if not client["floating"]:
                     dispatch("togglefloating", address)
+                for name, value in [
+                    ("opacity", "1"), ("opacity_inactive", "1"),
+                    ("opacity_override", "true"), ("opacity_inactive_override", "true"),
+                    ("rounding", "0"), ("no_anim", "true"),
+                ]:
+                    set_window_property(address, name, value)
                 dispatch("resizewindowpixel", "exact 900 500," + address)
                 dispatch("movewindowpixel", "exact 100 100," + address)
+                dispatch("focuswindow", address)
+                wait_for(lambda: (find_client(process.pid) or {}).get("size") == [900, 500], "icat final size")
                 wait_for(lambda: (find_client(process.pid) or {}).get("title") == "wisp-icat-waiting", "icat ready")
                 time.sleep(0.25)
                 (directory / "start").touch()
@@ -77,7 +97,7 @@ def main():
                     previous = pixels
                     time.sleep(0.06)
                 assert len(frames) >= 4 and transitions >= 4, ("animation stayed static", len(frames), transitions)
-                result = {"image": str(options.image.resolve()), "distinct_captures": len(frames), "changed_frames": transitions}
+                result = {"image": str(image), "generated_image": options.image is None, "distinct_captures": len(frames), "changed_frames": transitions}
                 (options.artifacts / "result.json").write_text(json.dumps(result, indent=2) + "\n")
                 print("PASS default kitten icat animation after client exit", result)
     finally:
