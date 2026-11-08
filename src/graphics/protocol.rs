@@ -1265,6 +1265,10 @@ impl Filter {
 }
 
 fn needs_filter(bytes: &[u8]) -> bool {
+    let Some(offset) = memchr::memchr(0x1b, bytes) else {
+        return false;
+    };
+    let bytes = &bytes[offset..];
     bytes.last() == Some(&0x1b)
         || [
             b"\x1b_",
@@ -1282,6 +1286,26 @@ fn needs_filter(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filter_detection_preserves_escape_prefixes_at_search_boundaries() {
+        for offset in [0, 1, 15, 16, 31, 32, 63, 64, 4095, 4096] {
+            for following in 0..=u8::MAX {
+                let mut bytes = vec![b'x'; offset + 66];
+                bytes[offset] = 0x1b;
+                bytes[offset + 1] = following;
+                assert_eq!(
+                    needs_filter(&bytes),
+                    matches!(following, b'_' | b']' | b'P' | b'^' | b'X' | b'c' | 0x1b),
+                    "offset {offset}, following {following}"
+                );
+                assert!(needs_filter(&bytes[..offset + 1]));
+            }
+        }
+        assert!(!needs_filter(&[]));
+        assert!(!needs_filter(b"ordinary text\t\r\n\xe4\xb8\xad"));
+        assert!(needs_filter(b"\x1b[31mordinary CSI\x1b_G"));
+    }
 
     fn filtered(chunks: &[&[u8]]) -> (Vec<u8>, Vec<Vec<u8>>) {
         let mut filter = Filter::default();

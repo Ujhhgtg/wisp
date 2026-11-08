@@ -146,3 +146,50 @@ build's key-to-snapshot p99 is 0.117–0.171 ms across 100-key samples at 20/35/
 intervals. All four GUI smoke commands pass, including default `icat` GIF
 playback after client exit; the general smoke uses 0.03 seconds of process CPU
 over its two-second idle interval.
+
+## Plain-text throughput follow-up
+
+A follow-up on 2026-11-08 compared commit `46fe6dd` with two focused scanning
+optimizations. Both release builds use the portable baseline CPU target, the
+installed Kitty benchmark, the production PTY/VT path, a 160×48 grid, and the
+same user configuration with 100,000 lines of scrollback. Rendering is excluded.
+Each workload runs for 500 repetitions, matching the payload volume of the
+reported full benchmark:
+
+```sh
+cargo run --release --example kitten_benchmark -- --repetitions 500 \
+  ascii unicode unique_unicode csi long_escape_codes images
+```
+
+| Kitty workload | Before these optimizations | After |
+| --- | ---: | ---: |
+| ASCII | 483.8 MB/s | 511.7 MB/s |
+| Unicode | 856.5 MB/s | 991.4 MB/s |
+| Unique multi-codepoint cells | 82.9 MB/s | 84.8 MB/s |
+| CSI with few characters | 158.9 MB/s | 156.6 MB/s |
+| Long escape codes | 1057.8 MB/s | 1115.2 MB/s |
+| Images | 1111.1 MB/s | 1092.5 MB/s |
+
+The reports are `target/performance-recheck/head-500.txt` and
+`target/performance-recheck/optimized-500.txt`. Plain-text improvements repeat
+in additional 500-repetition runs; smaller differences in CSI, images, and
+combining cells vary between runs. These results do not establish the cause of
+the entire difference between earlier user benchmarks, whose window dimensions
+and system load were not captured alongside the reports.
+
+Profiling found time in printable-codepoint scanning and the graphics
+prefilter. The native stream now finds printable UTF-32 runs with SIMD while
+preserving C0 and DEL handling. The graphics prefilter first checks for ESC;
+ordinary text avoids seven separate sequence searches. When ESC is present,
+the existing vectorized substring searches remain in use. An intermediate
+per-ESC iterator improved plain text but slowed escape-heavy workloads and
+was discarded after paired measurements.
+
+Differential native tests cover every byte around vector boundaries and every
+split of mixed UTF-8/control input; all 147 native stream tests pass. The Rust
+prefilter test covers all escape suffix bytes at search/chunk boundaries. The
+full Rust run passes 246 tests, and strict Clippy passes for all targets and
+features. The release also passes the complete general GUI smoke, graphics
+placeholder/relative-placement animation checks, default `icat` GIF playback
+after client exit, and the selected external VTTEST cases. The long-OSC
+optimization remains enabled throughout.

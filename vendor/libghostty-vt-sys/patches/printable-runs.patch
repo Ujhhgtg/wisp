@@ -1,0 +1,84 @@
+--- a/src/terminal/stream.zig
++++ b/src/terminal/stream.zig
+@@ -581,8 +581,7 @@
+                         continue;
+                     }
+ 
+-                    var end = i + 1;
+-                    while (end < cps.len and cps[end] > 0x1F and cps[end] != 0x7F) end += 1;
++                    const end = i + printableRunLength(cps[i..]);
+                     self.handler.vt(.print_slice, .{ .cps = cps[i..end] });
+                     i = end;
+                 }
+@@ -605,6 +604,22 @@
+             }
+         }
+ 
++        fn printableRunLength(cps: []const u32) usize {
++            var end: usize = 0;
++            if (comptime std.simd.suggestVectorLength(u32)) |vector_len| {
++                const CodepointVector = @Vector(vector_len, u32);
++                while (end + vector_len <= cps.len) {
++                    const values: CodepointVector = cps[end..][0..vector_len].*;
++                    const controls = (values <= @as(CodepointVector, @splat(0x1F))) |
++                        (values == @as(CodepointVector, @splat(0x7F)));
++                    if (std.simd.firstTrue(controls)) |index| return end + index;
++                    end += vector_len;
++                }
++            }
++            while (end < cps.len and cps[end] > 0x1F and cps[end] != 0x7F) end += 1;
++            return end;
++        }
++
+         /// Parses back-to-back escape sequences until none are left.
+         /// Returns the number of bytes consumed from the provided input.
+         ///
+@@ -4070,6 +4085,48 @@
+     for (0..bytes.len + 1) |split| {
+         var bulk: Stream(InvalidOscTestHandler) = .init(.{});
+         bulk.nextSlice(bytes[0..split]);
++        bulk.nextSlice(bytes[split..]);
++        try testing.expectEqual(scalar.parser.state, bulk.parser.state);
++        try testing.expectEqualDeep(scalar.handler, bulk.handler);
++    }
++}
++
++test "stream: printable run vector boundaries preserve controls" {
++    const positions = [_]usize{ 0, 1, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65 };
++    for (positions) |position| for (0..128) |control| {
++        var cps: [96]u32 = @splat(0x4E00);
++        cps[position] = @intCast(control);
++        const expected = if (control <= 0x1F or control == 0x7F) position else cps.len;
++        try testing.expectEqual(expected, Stream(InvalidOscTestHandler).printableRunLength(&cps));
++    };
++    try testing.expectEqual(@as(usize, 0), Stream(InvalidOscTestHandler).printableRunLength(&.{}));
++}
++
++test "stream: printable run bulk matches scalar for every byte" {
++    const positions = [_]usize{ 0, 1, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64 };
++    for (positions) |position| for (0..256) |value| {
++        var input: [160]u8 = undefined;
++        @memset(input[0..position], 'x');
++        input[position] = @intCast(value);
++        const suffix = "\x18\x1b[0m\xe4\xb8\xad\xc3\xa9END";
++        @memcpy(input[position + 1 ..][0..suffix.len], suffix);
++        const bytes = input[0 .. position + 1 + suffix.len];
++        var bulk: Stream(InvalidOscTestHandler) = .init(.{});
++        bulk.nextSlice(bytes);
++        var scalar: Stream(InvalidOscTestHandler) = .init(.{});
++        for (bytes) |byte| scalar.next(byte);
++        try testing.expectEqual(scalar.parser.state, bulk.parser.state);
++        try testing.expectEqualDeep(scalar.handler, bulk.handler);
++    };
++}
++
++test "stream: printable runs preserve every UTF-8 chunk boundary" {
++    const bytes = "printable text " ** 8 ++ "\xe4\xb8\xad\xc3\xa9\x7f\x10\x1f\t\r\n\x1b[0mEND";
++    var scalar: Stream(InvalidOscTestHandler) = .init(.{});
++    for (bytes) |byte| scalar.next(byte);
++    for (0..bytes.len + 1) |split| {
++        var bulk: Stream(InvalidOscTestHandler) = .init(.{});
++        bulk.nextSlice(bytes[0..split]);
+         bulk.nextSlice(bytes[split..]);
+         try testing.expectEqual(scalar.parser.state, bulk.parser.state);
+         try testing.expectEqualDeep(scalar.handler, bulk.handler);

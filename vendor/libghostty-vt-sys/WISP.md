@@ -43,6 +43,9 @@ build script. Wisp changes only:
   and blink defaults during DECSTR.
 - `standard-performance.patch` allocates DCS state only when needed and skips
   discarded OSC ASCII in batches while preserving control-byte handling.
+- `printable-runs.patch` finds printable UTF-32 runs with SIMD comparisons before
+  dispatching them to the existing print-slice handler. C0 and DEL still use
+  the established control path; UTF-8 decoding and cell writing are unchanged.
 
 The build records the complete patch set in its private Cargo output directory.
 When the patch set changes, only its managed source files are restored to the
@@ -82,3 +85,10 @@ tests, including every byte value at vector boundaries, input chunk splitting,
 and lazy-allocation failure and recovery. Controlled native comparisons show
 ASCII, Unicode, combining-cell, and CSI throughput within 2% or better than the
 pre-standard baseline; discarded long OSC no longer slows the parser.
+
+The printable-run changes pass 147 native stream tests. New differential cases
+check all byte values around vector boundaries, empty and control-only runs,
+and every split in mixed UTF-8/control input against scalar parsing. On the
+portable baseline CPU target, paired native Unicode fixtures improve from
+approximately 1074 to 1170 MiB/s without changing terminal features or CPU
+compatibility. End-to-end measurements are recorded in Wisp's performance notes.

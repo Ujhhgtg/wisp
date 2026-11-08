@@ -21,6 +21,7 @@ const WISP_PATCHES: &[&str] = &[
     "standard-rendition.patch",
     "standard-host-reset.patch",
     "standard-performance.patch",
+    "printable-runs.patch",
 ];
 
 /// File name of the static archive on Windows. Ghostty installs it under this
