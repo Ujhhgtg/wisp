@@ -1,6 +1,6 @@
 # wisp
 
-wisp is a Linux terminal emulator written in Rust based on `libghostty-vt`,
+wisp is a terminal emulator written in Rust based on `libghostty-vt`,
 `winit`, `wgpu`, and `glyphon`.
 
 ## features
@@ -8,20 +8,10 @@ wisp is a Linux terminal emulator written in Rust based on `libghostty-vt`,
 - gpu rendering
 - ligatures
 - kitty keyboard protocol
-- kitty graphics protocol, including animations, Unicode placeholders, and relative placements
+- kitty graphics protocol
 - mouse
 - hyperlinks
 - animated cursor
-- colored underline styles, strikeout, overline, conceal, and blinking text
-- OSC 52 clipboard writes and IME preedit
-
-The tested VT/xterm compatibility profile, external VTTEST checks, and legacy
-boundaries are documented in [`docs/conformance.md`](docs/conformance.md).
-
-Graphics commands, resource limits, and validation instructions are documented in
-[`docs/kitty-graphics.md`](docs/kitty-graphics.md).
-Ligatures preserve per-cell colors across color and selection changes; see
-[`docs/text-rendering.md`](docs/text-rendering.md).
 
 ## configuration
 
@@ -36,7 +26,7 @@ path.
 
 ## build prerequisites
 
-`libghostty-vt-sys 0.2.2` builds the pinned Ghostty source with Zig `0.15.2`.
+first install `mise`, then:
 
 ```sh
 zig version              # should report 0.15.2
@@ -55,11 +45,6 @@ to launch another program or an explicit config:
 cargo run --release -- --config /path/to/config.toml -e /bin/bash
 ```
 
-`Ctrl+Shift+C/V` copies and pastes, `Shift+PageUp/PageDown` scrolls history,
-and `Ctrl+Shift+Plus/Minus/0` increases, decreases, or resets font size.
-`[protocols] clipboard_write = false` disables application clipboard writes;
-clipboard-read requests are ignored.
-
 ## validation
 
 ```sh
@@ -68,9 +53,3 @@ cargo build --release
 cargo build --example keyboard_driver --example pointer_driver
 python3 tests/gui_smoke.py
 ```
-
-The general GUI smoke checks fonts, colors, margins, hyperlinks, exact mouse
-bytes, image pixels, real copy/paste, resizing, and idle CPU. It requires Hyprland
-with Lua dispatchers, `grim`, `wtype`, `xkbcli`, `wl-copy`, `wl-paste`, `kitten`,
-Python, and Pillow. It makes only its own test windows opaque, preserves the
-clipboard/PRIMARY, and restores focus afterward.
