@@ -673,17 +673,16 @@ fn config_candidates_from(
         push_unique(&mut candidates, xdg_config_home.join(CONFIG_RELATIVE_PATH));
     }
 
-    push_unique(
-        &mut candidates,
-        current_dir.join(PROJECT_CONFIG_RELATIVE_PATH),
-    );
-
     if let Some(home) = non_empty_path(home) {
         push_unique(
             &mut candidates,
             home.join(".config").join(CONFIG_RELATIVE_PATH),
         );
     }
+    push_unique(
+        &mut candidates,
+        current_dir.join(PROJECT_CONFIG_RELATIVE_PATH),
+    );
     candidates
 }
 
@@ -781,8 +780,8 @@ kitty_graphics = false
             candidates,
             vec![
                 PathBuf::from("/xdg/wisp/config.toml"),
-                PathBuf::from("/project/.config/wisp/config.toml"),
                 PathBuf::from("/home/tester/.config/wisp/config.toml"),
+                PathBuf::from("/project/.config/wisp/config.toml"),
             ]
         );
     }
@@ -798,8 +797,8 @@ kitty_graphics = false
         assert_eq!(
             candidates,
             vec![
-                PathBuf::from("/project/.config/wisp/config.toml"),
                 PathBuf::from("/home/tester/.config/wisp/config.toml"),
+                PathBuf::from("/project/.config/wisp/config.toml"),
             ]
         );
     }
