@@ -94,3 +94,55 @@ compares direct VT parsing with and without periodic production snapshots;
 it intentionally requests snapshots even while mode 2026 is set to isolate
 their cost. `pointer_throughput` measures the output observer separately;
 its hot-cache byte-search rates are not whole-terminal throughput.
+
+## Combined graphics and rendering review
+
+The 2026-11-08 review of the VT conformance, graphics transport, and multicolor
+ligature fixes measured these additional changes against commit `3d1de3f`:
+
+| CPU workload | Before | After |
+| --- | ---: | ---: |
+| Background-only updates, 160×48 FiraCode grid | 5451.6 µs/frame | 92.7 µs/frame |
+| Cursor-only updates, same grid | 23.1 µs/frame | 23.0 µs/frame |
+| Dirty uniform text, same grid | 2136.0 µs/frame | 2174.0 µs/frame |
+| Dirty alternating-color text, same grid | 2382.7 µs/frame | 2391.8 µs/frame |
+| Image-upload packet serialization | 3556–3559 MiB/s | 4490–4509 MiB/s |
+
+The text comparison uses 300 updates per workload with the production
+`TextLayout`. Background and decoration changes now retain shaped glyphs and
+update the cached attributes without invoking shaping. Cursor-only caching is
+preserved; ordinary dirty-text costs remain within short-run variation. A
+maintained diagnostic resets the scene before each workload and uses the
+configured font:
+
+```sh
+cargo run --release --example text_throughput -- 300
+```
+
+Upload serialization reuses the first header and a base64 packet buffer instead
+of allocating maps, strings, and packets for every 3072 payload bytes. A paired
+microbenchmark of 40 eight-MiB uploads measures approximately 26% higher
+serialization throughput, with allocation/reallocation calls decreasing from
+19,127 to 15 per upload. Framing tests verify control fields, continuation flags,
+base64 chunk limits, and exact reconstructed bytes across chunk boundaries.
+These are component CPU measurements, excluding PTY parsing, GPU work, and
+physical display latency; they are not whole-terminal speedup claims.
+
+A longer paired production GUI run compares the imported fixes with the reviewed
+build, using `--render --repetitions 100`, a 1600×900 window, a 171×44 grid, and
+the same user configuration with 100,000 lines of scrollback:
+
+| Kitty workload | Imported fixes | Reviewed build |
+| --- | ---: | ---: |
+| Unique multi-codepoint Unicode cells | 79.4 MB/s | 80.6 MB/s |
+| CSI codes with few characters | 147.9 MB/s | 148.9 MB/s |
+| Long escape codes | 1088.4 MB/s | 1101.2 MB/s |
+
+Reports are saved as `target/gui-benchmark/{imported,reviewed}-render-100.json`.
+These longer runs do not reproduce the small slowdown observed in an initial
+30-repetition comparison. Kitty's timings still measure parsing/query completion
+with rendering enabled, rather than physical display latency. The reviewed
+build's key-to-snapshot p99 is 0.117–0.171 ms across 100-key samples at 20/35/50 ms
+intervals. All four GUI smoke commands pass, including default `icat` GIF
+playback after client exit; the general smoke uses 0.03 seconds of process CPU
+over its two-second idle interval.

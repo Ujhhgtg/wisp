@@ -151,7 +151,7 @@ do not correspond to the requested characters. Dependencies include Hyprland
 Lua dispatchers, `grim`, `wtype`, `xkbcli`, `wl-copy`, `wl-paste`, `kitten`, Python,
 and Pillow. Artifacts are written to `target/gui-smoke/`.
 
-The validated full run passes 236 automated tests, plus the explicitly invoked
+The validated full run passes 245 automated tests, plus the explicitly invoked
 external VTTEST integration. The latter is one ignored test in a normal Cargo
 run and is executed separately with the external binary available. The final
 release also passes the full general GUI smoke command above, with no skipped
@@ -168,12 +168,12 @@ cargo run --release --example kitten_benchmark -- --repetitions 30
 
 | Workload | Reported MB/s |
 | --- | ---: |
-| ASCII | 497.3 |
-| Unicode | 825.1 |
-| Unique multi-codepoint cells | 82.6 |
-| CSI with few characters | 155.6 |
-| Long escape codes | 1087.3 |
-| Images | 1091.5 |
+| ASCII | 487.6 |
+| Unicode | 868.6 |
+| Unique multi-codepoint cells | 84.0 |
+| CSI with few characters | 154.5 |
+| Long escape codes | 1074.5 |
+| Images | 1086.8 |
 
 A longer, 100-repetition long-escape run improved from 128.7 MB/s before the
 DCS/OSC performance fixes to 1090.3 MB/s afterward. DCS state is allocated on
@@ -182,6 +182,6 @@ its terminators or cancellation controls. These measurements exclude GPU
 rendering and do not establish physical input-to-display latency.
 
 The production input-latency probe measured key-to-snapshot p99 values of
-0.087–0.248 ms across 20/35/50 ms input intervals, with 100 keys per interval.
-The final general GUI smoke used 0.05 seconds of process CPU over its two-second
+0.117–0.171 ms across 20/35/50 ms input intervals, with 100 keys per interval.
+The final general GUI smoke used 0.03 seconds of process CPU over its two-second
 idle interval.
