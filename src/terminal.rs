@@ -12,7 +12,7 @@ use libghostty_vt::mouse;
 use libghostty_vt::render::{CellIterator, CursorVisualStyle, RowIterator};
 use libghostty_vt::screen::CellWide;
 use libghostty_vt::selection::{FormatOptions, Selection};
-use libghostty_vt::style::{PaletteIndex, RgbColor};
+use libghostty_vt::style::{PaletteIndex, RgbColor, StyleColor, Underline};
 use libghostty_vt::terminal::{Mode, Point, PointCoordinate, ScrollViewport};
 use libghostty_vt::{RenderState, Terminal, TerminalOptions};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -70,6 +70,12 @@ pub struct CellSnapshot {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
+    pub underline_style: UnderlineStyle,
+    pub underline_color: Option<Rgb>,
+    pub strikethrough: bool,
+    pub overline: bool,
+    pub blink: bool,
+    pub hidden: bool,
     pub selected: bool,
 }
 
@@ -83,9 +89,26 @@ impl Default for CellSnapshot {
             bold: false,
             italic: false,
             underline: false,
+            underline_style: UnderlineStyle::None,
+            underline_color: None,
+            strikethrough: false,
+            overline: false,
+            blink: false,
+            hidden: false,
             selected: false,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UnderlineStyle {
+    #[default]
+    None,
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -244,6 +267,24 @@ fn capture_snapshot(
                 bold: style.bold,
                 italic: style.italic,
                 underline: !matches!(style.underline, libghostty_vt::style::Underline::None),
+                underline_style: match style.underline {
+                    Underline::None => UnderlineStyle::None,
+                    Underline::Single => UnderlineStyle::Single,
+                    Underline::Double => UnderlineStyle::Double,
+                    Underline::Curly => UnderlineStyle::Curly,
+                    Underline::Dotted => UnderlineStyle::Dotted,
+                    Underline::Dashed => UnderlineStyle::Dashed,
+                    _ => UnderlineStyle::Single,
+                },
+                underline_color: match style.underline_color {
+                    StyleColor::None => None,
+                    StyleColor::Rgb(color) => Some(color.into()),
+                    StyleColor::Palette(index) => Some(colors.palette[usize::from(index.0)].into()),
+                },
+                strikethrough: style.strikethrough,
+                overline: style.overline,
+                blink: style.blink,
+                hidden: style.invisible,
                 selected: cell_view.is_selected()?,
             });
         }
@@ -273,6 +314,7 @@ fn capture_snapshot(
 
 #[derive(Debug)]
 pub enum SessionEvent {
+    Bell,
     Clipboard(String),
     PrimarySelection(String),
     PastePrimary,
@@ -409,8 +451,7 @@ impl Session {
             pixel_height: 0,
         })?;
 
-        command.env("TERM", "xterm-ghostty");
-        command.env("COLORTERM", "truecolor");
+        crate::terminfo::configure_environment(&mut command);
         let mut child = pair.slave.spawn_command(command)?;
         drop(pair.slave);
 
@@ -529,6 +570,7 @@ fn run_terminal(
         cell_width: 8,
         cell_height: 18,
     });
+    let last_bell = Cell::new(Instant::now() - Duration::from_millis(100));
     let mut terminal = Terminal::new(TerminalOptions {
         cols,
         rows,
@@ -553,6 +595,65 @@ fn run_terminal(
             if let Ok(title) = terminal.title() {
                 let _ = event_tx.send(SessionEvent::Title(title.to_owned()));
             }
+        }
+    })?;
+    terminal.on_bell({
+        let event_tx = event_tx.clone();
+        let last_bell = &last_bell;
+        move |_| {
+            if last_bell.get().elapsed() >= Duration::from_millis(100) {
+                last_bell.set(Instant::now());
+                let _ = event_tx.send(SessionEvent::Bell);
+            }
+        }
+    })?;
+    terminal.on_xtversion(|_| Some(concat!("wisp ", env!("CARGO_PKG_VERSION"))))?;
+    terminal.on_color_scheme(|terminal| {
+        let background = terminal
+            .bg_color()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| Rgb::from(config.colors.background).into());
+        let luminance = u32::from(background.r) * 299
+            + u32::from(background.g) * 587
+            + u32::from(background.b) * 114;
+        Some(if luminance >= 128_000 {
+            libghostty_vt::terminal::ColorScheme::Light
+        } else {
+            libghostty_vt::terminal::ColorScheme::Dark
+        })
+    })?;
+    terminal.on_clipboard_write({
+        let event_tx = event_tx.clone();
+        let enabled = config.protocols.clipboard_write;
+        move |_, write| {
+            use libghostty_vt::terminal::{ClipboardLocation, ClipboardWriteError};
+            if !enabled {
+                return Err(ClipboardWriteError::Denied);
+            }
+            let mut representations = write.contents();
+            let text = if representations.len() == 0 {
+                String::new()
+            } else {
+                let content = representations
+                    .find(|content| {
+                        content.mime == "text/plain" || content.mime.starts_with("text/plain;")
+                    })
+                    .ok_or(ClipboardWriteError::Unsupported)?;
+                if content.data.len() > 1024 * 1024 {
+                    return Err(ClipboardWriteError::InvalidData);
+                }
+                content.data.to_owned()
+            };
+            let event = match write.location() {
+                ClipboardLocation::Standard => SessionEvent::Clipboard(text),
+                ClipboardLocation::Selection | ClipboardLocation::Primary => {
+                    SessionEvent::PrimarySelection(text)
+                }
+            };
+            event_tx
+                .send(event)
+                .map_err(|_| ClipboardWriteError::IoError)
         }
     })?;
 

@@ -252,6 +252,32 @@ fn repeated_clean_and_dirty_snapshots_preserve_grid_size_and_colors() {
 }
 
 #[test]
+fn complete_sgr_decorations_and_conceal_survive_the_production_snapshot() {
+    let mut fixture = Fixture::new(8, 2);
+    let frame = fixture.feed(b"\x1b[4:3;58;2;12;34;56;9;53;5mA\x1b[0mB\x1b[8mC");
+    let decorated = &frame.cells[0];
+    assert_eq!(
+        decorated.underline_style,
+        wisp::terminal::UnderlineStyle::Curly
+    );
+    assert_eq!(
+        decorated.underline_color,
+        Some(Rgb {
+            red: 12,
+            green: 34,
+            blue: 56
+        })
+    );
+    assert!(decorated.strikethrough && decorated.overline && decorated.blink);
+    let reset = &frame.cells[1];
+    assert_eq!(reset.underline_style, wisp::terminal::UnderlineStyle::None);
+    assert_eq!(reset.underline_color, None);
+    assert!(!reset.strikethrough && !reset.overline && !reset.blink && !reset.hidden);
+    assert!(frame.cells[2].hidden);
+    assert_eq!(frame.cells[2].foreground, frame.background);
+}
+
+#[test]
 fn dense_combining_graphemes_survive_capacity_growth_and_mixed_width_reflow() {
     let mut fixture = Fixture::new(160, 64);
     let mut expected = String::new();

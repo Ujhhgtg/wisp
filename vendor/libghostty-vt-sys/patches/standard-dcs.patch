@@ -1,0 +1,245 @@
+diff --git a/src/terminal/dcs.zig b/src/terminal/dcs.zig
+index 425325d4a..5203b8e53 100644
+--- a/src/terminal/dcs.zig
++++ b/src/terminal/dcs.zig
+@@ -143,7 +143,8 @@ pub const Handler = struct {
+ 
+             .decrqss => |*buffer| {
+                 if (buffer.len >= buffer.data.len) {
+-                    return error.OutOfMemory;
++                    buffer.invalid = true;
++                    return null;
+                 }
+ 
+                 buffer.data[buffer.len] = byte;
+@@ -178,7 +179,7 @@ pub const Handler = struct {
+                 break :xtgettcap .{ .xtgettcap = .{ .data = list.* } };
+             },
+ 
+-            .decrqss => |buffer| .{ .decrqss = switch (buffer.len) {
++            .decrqss => |buffer| .{ .decrqss = if (buffer.invalid) .none else switch (buffer.len) {
+                 0 => .none,
+                 1 => switch (buffer.data[0]) {
+                     'm' => .sgr,
+@@ -191,6 +192,10 @@ pub const Handler = struct {
+                         'q' => .decscusr,
+                         else => .none,
+                     },
++                    '"' => switch (buffer.data[1]) {
++                        'q' => .decsca,
++                        else => .none,
++                    },
+                     else => .none,
+                 },
+                 else => unreachable,
+@@ -254,6 +259,7 @@ pub const Command = union(enum) {
+         decscusr,
+         decstbm,
+         decslrm,
++        decsca,
+     };
+ };
+ 
+@@ -272,6 +278,7 @@ const State = union(enum) {
+     decrqss: struct {
+         data: [2]u8 = undefined,
+         len: u2 = 0,
++        invalid: bool = false,
+     },
+ 
+     /// Tmux control mode: https://github.com/tmux/tmux/wiki/Control-Mode
+@@ -402,7 +409,10 @@ test "DECRQSS invalid command" {
+     _ = h.put('"');
+     _ = h.put(' ');
+     _ = h.put('q');
+-    try testing.expect(h.unhook() == null);
++    var invalid = h.unhook().?;
++    defer invalid.deinit();
++    try testing.expect(invalid == .decrqss);
++    try testing.expect(invalid.decrqss == .none);
+ }
+ 
+ test "tmux enter and implicit exit" {
+diff --git a/src/terminal/stream_terminal.zig b/src/terminal/stream_terminal.zig
+index 1b29ca693..814a28e7d 100644
+--- a/src/terminal/stream_terminal.zig
++++ b/src/terminal/stream_terminal.zig
+@@ -4,6 +4,7 @@ const testing = std.testing;
+ const apc = @import("apc.zig");
+ const clipboard = @import("clipboard.zig");
+ const csi = @import("csi.zig");
++const dcs = @import("dcs.zig");
+ const device_attributes = @import("device_attributes.zig");
+ const device_status = @import("device_status.zig");
+ const stream = @import("stream.zig");
+@@ -16,6 +17,7 @@ const osc_color = @import("osc/parsers/color.zig");
+ const kitty_color = @import("kitty/color.zig");
+ const size_report = @import("size_report.zig");
+ const Terminal = @import("Terminal.zig");
++const terminfo = @import("../terminfo/main.zig");
+ 
+ const log = std.log.scoped(.stream_terminal);
+ 
+@@ -45,6 +47,7 @@ pub const Handler = struct {
+     /// to send commands to the terminal emulator. This is used by
+     /// the kitty graphics protocol.
+     apc_handler: apc.Handler = .{},
++    dcs_handler: dcs.Handler = .{},
+ 
+     /// Default cursor style used by DECSCUSR reset (CSI 0 q).
+     default_cursor: bool = true,
+@@ -136,6 +139,7 @@ pub const Handler = struct {
+ 
+     pub fn deinit(self: *Handler) void {
+         self.apc_handler.deinit();
++        self.dcs_handler.deinit();
+     }
+ 
+     pub fn vt(
+@@ -299,12 +303,21 @@ pub const Handler = struct {
+             .xtversion => self.reportXtversion(),
+             .clipboard_contents => try self.clipboardContents(value.kind, value.data),
+ 
+-            // No supported DCS commands have any terminal-modifying effects,
+-            // but they may in the future. For now we just ignore it.
+-            .dcs_hook,
+-            .dcs_put,
+-            .dcs_unhook,
+-            => {},
++            .dcs_hook => if (self.dcs_handler.hook(self.terminal.gpa(), value)) |command| {
++                var owned = command;
++                defer owned.deinit();
++                try self.dcsCommand(&owned);
++            },
++            .dcs_put => if (self.dcs_handler.put(value)) |command| {
++                var owned = command;
++                defer owned.deinit();
++                try self.dcsCommand(&owned);
++            },
++            .dcs_unhook => if (self.dcs_handler.unhook()) |command| {
++                var owned = command;
++                defer owned.deinit();
++                try self.dcsCommand(&owned);
++            },
+ 
+             // Have no terminal-modifying effect
+             .show_desktop_notification,
+@@ -320,6 +333,67 @@ pub const Handler = struct {
+         func(self, data);
+     }
+ 
++    fn dcsCommand(self: *Handler, command: *dcs.Command) !void {
++        if (self.effects.write_pty == null) return;
++        switch (command.*) {
++            .tmux => {},
++            .xtgettcap => |*request| {
++                const map = comptime terminfo.ghostty.xtgettcapMap();
++                while (request.next()) |key| {
++                    if (map.get(key)) |response| {
++                        var buffer: [4096]u8 = undefined;
++                        const terminated = try std.fmt.bufPrintZ(&buffer, "{s}", .{response});
++                        self.writePty(terminated);
++                    } else if (key.len <= 128) {
++                        var buffer: [138]u8 = undefined;
++                        const response = try std.fmt.bufPrintZ(&buffer, "\x1bP0+r{s}\x1b\\", .{key});
++                        self.writePty(response);
++                    }
++                }
++            },
++            .decrqss => |request| {
++                var response: [256]u8 = undefined;
++                var output = std.io.fixedBufferStream(&response);
++                const writer = output.writer();
++                const prefix_len = "\x1bP0$r".len;
++                output.pos = prefix_len;
++                switch (request) {
++                    .none => {},
++                    .sgr => {
++                        const attributes = try self.terminal.printAttributes(output.buffer[output.pos..]);
++                        output.pos += attributes.len;
++                        try writer.writeByte('m');
++                    },
++                    .decscusr => {
++                        const blink = self.terminal.modes.get(.cursor_blinking);
++                        const style: u8 = switch (self.terminal.screens.active.cursor.cursor_style) {
++                            .block, .block_hollow => if (blink) 1 else 2,
++                            .underline => if (blink) 3 else 4,
++                            .bar => if (blink) 5 else 6,
++                        };
++                        try writer.print("{d} q", .{style});
++                    },
++                    .decsca => try writer.print("{d}\"q", .{@intFromBool(self.terminal.screens.active.cursor.protected)}),
++                    .decstbm => try writer.print("{d};{d}r", .{
++                        self.terminal.scrolling_region.top + 1,
++                        self.terminal.scrolling_region.bottom + 1,
++                    }),
++                    .decslrm => if (self.terminal.modes.get(.enable_left_and_right_margin)) {
++                        try writer.print("{d};{d}s", .{
++                            self.terminal.scrolling_region.left + 1,
++                            self.terminal.scrolling_region.right + 1,
++                        });
++                    },
++                }
++                const valid = output.pos > prefix_len;
++                try writer.writeAll("\x1b\\");
++                _ = try std.fmt.bufPrint(response[0..prefix_len], "\x1bP{d}$r", .{@intFromBool(valid)});
++                response[output.pos] = 0;
++                self.writePty(response[0..output.pos :0]);
++            },
++        }
++    }
++
+     fn bell(self: *Handler) void {
+         const func = self.effects.bell orelse return;
+         func(self);
+@@ -1919,6 +1993,38 @@ test "standard VT DECSTR preserves position text history and tabs" {
+     try testing.expectEqual(@as(usize, 5), t.screens.active.cursor.x);
+ }
+ 
++test "standard DCS query replies expose current state and known capabilities" {
++    var t: Terminal = try .init(testing.allocator, .{ .cols = 24, .rows = 6 });
++    defer t.deinit(testing.allocator);
++    const Capture = struct {
++        var response: [4096]u8 = undefined;
++        var length: usize = 0;
++        fn writePty(_: *Handler, data: [:0]const u8) void {
++            @memcpy(response[length..][0..data.len], data);
++            length += data.len;
++        }
++    };
++    Capture.length = 0;
++    var handler: Handler = .init(&t);
++    handler.effects.write_pty = &Capture.writePty;
++    var s: Stream = .initAlloc(testing.allocator, handler);
++    defer s.deinit();
++    s.nextSlice("\x1bP$qm\x1b\\");
++    try testing.expectEqualStrings("\x1bP1$r0m\x1b\\", Capture.response[0..Capture.length]);
++    Capture.length = 0;
++    s.nextSlice("\x1b[2;5r\x1bP$qr\x1b\\");
++    try testing.expectEqualStrings("\x1bP1$r2;5r\x1b\\", Capture.response[0..Capture.length]);
++    Capture.length = 0;
++    s.nextSlice("\x1b[1\"q\x1bP$q\"q\x1b\\");
++    try testing.expectEqualStrings("\x1bP1$r1\"q\x1b\\", Capture.response[0..Capture.length]);
++    Capture.length = 0;
++    s.nextSlice("\x1bP$qz\x1b\\");
++    try testing.expectEqualStrings("\x1bP0$r\x1b\\", Capture.response[0..Capture.length]);
++    Capture.length = 0;
++    s.nextSlice("\x1bP+q436f;524742;776973702d6e6f6e6578697374656e74\x1b\\");
++    try testing.expectEqualStrings("\x1bP1+r436F=323536\x1b\\\x1bP1+r524742=38\x1b\\\x1bP0+r776973702D6E6F6E6578697374656E74\x1b\\", Capture.response[0..Capture.length]);
++}
++
+ test "stream: CSI W with intermediate but no params" {
+     // Regression test from AFL++ crash. CSI ? W without
+     // parameters caused an out-of-bounds access on input.params[0].
+diff --git a/src/termio/stream_handler.zig b/src/termio/stream_handler.zig
+index 712bff814..4de8e6443 100644
+--- a/src/termio/stream_handler.zig
++++ b/src/termio/stream_handler.zig
+@@ -513,6 +513,7 @@ pub const StreamHandler = struct {
+                         };
+                         try writer.print("{d} q", .{style});
+                     },
++                    .decsca => try writer.print("{d}\"q", .{@intFromBool(self.terminal.screens.active.cursor.protected)}),
+ 
+                     .decstbm => {
+                         try writer.print("{d};{d}r", .{

@@ -16,6 +16,11 @@ const WISP_PATCHES: &[&str] = &[
     "graphics-replace.patch",
     "graphics-relative-anchors.patch",
     "graphics-geometry.patch",
+    "standard-vt.patch",
+    "standard-dcs.patch",
+    "standard-rendition.patch",
+    "standard-host-reset.patch",
+    "standard-performance.patch",
 ];
 
 /// File name of the static archive on Windows. Ghostty installs it under this

@@ -7,7 +7,7 @@ import time
 
 from PIL import Image
 
-from gui_smoke import ROOT, dispatch, find_client, run, wait_for
+from gui_smoke import ROOT, dispatch, find_client, run, set_window_property, wait_for
 
 
 PROBE = r"""
@@ -78,12 +78,21 @@ def main():
                 address = "address:" + client["address"]
                 if not client["floating"]:
                     dispatch("togglefloating", address)
+                for name, value in [
+                    ("opacity", "1"), ("opacity_inactive", "1"),
+                    ("opacity_override", "true"), ("opacity_inactive_override", "true"),
+                    ("rounding", "0"), ("no_anim", "true"),
+                ]:
+                    set_window_property(address, name, value)
                 dispatch("resizewindowpixel", "exact 900 500," + address)
                 dispatch("movewindowpixel", "exact 100 100," + address)
+                dispatch("focuswindow", address)
+                wait_for(lambda: (find_client(process.pid) or {}).get("size") == [900, 500], "graphics final size")
                 wait_for(lambda: (find_client(process.pid) or {}).get("title") == "wisp-graphics-waiting", "graphics child")
                 time.sleep(0.25)
                 (directory / "start").touch()
                 wait_for(lambda: (find_client(process.pid) or {}).get("title") == "wisp-graphics-ready", "graphics initialization")
+                time.sleep(0.15)
                 client = find_client(process.pid)
                 x, y = client["at"]
                 width, height = client["size"]

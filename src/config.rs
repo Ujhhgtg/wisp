@@ -418,6 +418,7 @@ pub struct ProtocolConfig {
     pub bracketed_paste: bool,
     pub focus_events: bool,
     pub hyperlinks: bool,
+    pub clipboard_write: bool,
 }
 
 impl Default for ProtocolConfig {
@@ -428,6 +429,7 @@ impl Default for ProtocolConfig {
             bracketed_paste: true,
             focus_events: true,
             hyperlinks: true,
+            clipboard_write: true,
         }
     }
 }

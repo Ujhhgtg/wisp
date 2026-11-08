@@ -101,12 +101,13 @@ Unicode image, and an image positioned relative to a virtual parent. It requires
 `grim`, Python Pillow, and the same compositor helpers as `gui_smoke.py`.
 Screenshots and results are written to `target/gui-graphics/`.
 
-The final full Rust test run passes 173 tests. The separate older general GUI
-smoke has compositor-sensitive margin/link scans and focus-dependent input
-checks: those did not pass unchanged on the transparent test desktop. The new
-graphics GUI test passes with real animation and placeholder pixels; static
-`icat` also produces its expected 3,200-pixel rectangle when measured using
-compositor-tolerant color dominance rather than its original absolute threshold.
+The graphics tests run alongside the broader VT/system suites described in
+[terminal conformance](conformance.md). The general GUI smoke now controls only
+its own windows' compositor properties, uses actual PTY geometry, and verifies
+the image against a truecolor reference. It passes without skipped checks,
+including exactly 3,200 static `icat` image pixels, hyperlinks, mouse input,
+copy/paste, and resizing. The dedicated graphics GUI test checks real animation,
+Unicode placeholder pixels, and relative images.
 
 Performance checks preserve a direct path for ordinary VT/CSI output. In the
 same 171×44 GUI, a paired 100-repetition randomized CSI run measured 158.6 MiB/s

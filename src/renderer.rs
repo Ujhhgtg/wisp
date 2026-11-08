@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
 use glyphon::{
-    Cache, Color, ColorMode, Resolution, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
+    Attrs, Buffer, Cache, Color, ColorMode, Family, Metrics, Resolution, Shaping, TextArea,
+    TextAtlas, TextBounds, TextRenderer, Viewport, Wrap,
 };
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
@@ -15,7 +16,7 @@ use crate::geometry::GridGeometry;
 use crate::graphics::{GraphicsSnapshot, ImageLayer};
 use crate::image_renderer::ImageRenderer;
 use crate::links::LinkTarget;
-use crate::terminal::{Rgb, TerminalSnapshot};
+use crate::terminal::{Rgb, TerminalSnapshot, UnderlineStyle};
 
 #[path = "text_layout.rs"]
 mod text_layout;
@@ -48,12 +49,17 @@ pub struct Renderer {
     glyph_cache: Cache,
     text_atlas: TextAtlas,
     text_renderer: TextRenderer,
+    cursor_text_renderer: TextRenderer,
+    preedit_renderer: TextRenderer,
+    preedit_buffer: Buffer,
+    preedit: String,
     viewport: Viewport,
     rect_pipeline: wgpu::RenderPipeline,
     rect_buffer: wgpu::Buffer,
     rect_buffer_size: u64,
     rect_vertices: Vec<RectVertex>,
     background_vertex_count: usize,
+    decoration_vertex_count: usize,
     snapshot: Option<TerminalSnapshot>,
     config: Config,
     scale_factor: f32,
@@ -67,6 +73,10 @@ pub struct Renderer {
     hover: Option<LinkTarget>,
     frame_interval: Duration,
     surface_retry: Option<Instant>,
+    text_blink_epoch: Instant,
+    has_blinking_text: bool,
+    bell_until: Option<Instant>,
+    focused: bool,
 }
 
 impl Renderer {
@@ -130,7 +140,7 @@ impl Renderer {
         config: Config,
         scale_factor: f32,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let layout = TextLayout::new(&config, scale_factor)?;
+        let mut layout = TextLayout::new(&config, scale_factor)?;
         let image_renderer = ImageRenderer::new(&device, surface_config.format);
         let glyph_cache = Cache::new(&device);
         let mut text_atlas = make_text_atlas(&device, &queue, &glyph_cache, surface_config.format);
@@ -139,6 +149,22 @@ impl Renderer {
             &device,
             wgpu::MultisampleState::default(),
             None,
+        );
+        let cursor_text_renderer = TextRenderer::new(
+            &mut text_atlas,
+            &device,
+            wgpu::MultisampleState::default(),
+            None,
+        );
+        let preedit_renderer = TextRenderer::new(
+            &mut text_atlas,
+            &device,
+            wgpu::MultisampleState::default(),
+            None,
+        );
+        let preedit_buffer = Buffer::new(
+            &mut layout.font_system,
+            Metrics::new(layout.metrics.font_size, layout.metrics.height as f32),
         );
         let viewport = Viewport::new(&device, &glyph_cache);
         let rect_pipeline = create_rect_pipeline(&device, surface_config.format);
@@ -162,12 +188,17 @@ impl Renderer {
             glyph_cache,
             text_atlas,
             text_renderer,
+            cursor_text_renderer,
+            preedit_renderer,
+            preedit_buffer,
+            preedit: String::new(),
             viewport,
             rect_pipeline,
             rect_buffer,
             rect_buffer_size,
             rect_vertices: Vec::new(),
             background_vertex_count: 0,
+            decoration_vertex_count: 0,
             snapshot: None,
             config,
             scale_factor,
@@ -181,6 +212,10 @@ impl Renderer {
             hover: None,
             frame_interval: Duration::from_secs_f64(1.0 / 60.0),
             surface_retry: None,
+            text_blink_epoch: Instant::now(),
+            has_blinking_text: false,
+            bell_until: None,
+            focused: true,
         })
     }
 
@@ -207,6 +242,7 @@ impl Renderer {
             Ok(layout) => {
                 self.layout = layout;
                 self.scale_factor = scale_factor;
+                self.set_preedit(self.preedit.clone());
                 self.reset_atlas();
                 self.prepared_graphics = None;
                 self.cursor_animation.hide();
@@ -220,6 +256,22 @@ impl Renderer {
 
     pub fn cell_geometry(&self) -> (u32, u32) {
         (self.layout.metrics.width, self.layout.metrics.height)
+    }
+
+    pub fn set_font_size(&mut self, points: f32) -> Result<(), String> {
+        let mut config = self.config.clone();
+        config.font.size = points.clamp(2.0, 96.0);
+        let layout = TextLayout::new(&config, self.scale_factor)?;
+        self.config = config;
+        self.layout = layout;
+        self.set_preedit(self.preedit.clone());
+        self.reset_atlas();
+        self.prepared_graphics = None;
+        self.cursor_animation.hide();
+        if let Some(snapshot) = self.snapshot.clone() {
+            self.set_snapshot(snapshot);
+        }
+        Ok(())
     }
 
     pub fn terminal_size(&self) -> (u16, u16) {
@@ -243,17 +295,66 @@ impl Renderer {
         if let Some(retry) = self.surface_retry {
             return Some(retry);
         }
-        if self.cursor_animating {
-            return Some(self.last_frame + self.frame_interval);
-        }
-        let cursor = self.snapshot.as_ref()?.cursor;
-        if !cursor.visible || !cursor.blinking || !self.config.cursor.blink {
-            return None;
-        }
-        let interval = Duration::from_millis(530);
-        let elapsed = self.cursor_activity.elapsed();
-        let periods = elapsed.as_millis() / interval.as_millis() + 1;
-        Some(self.cursor_activity + Duration::from_millis((periods * 530) as u64))
+        let cursor = self.snapshot.as_ref().map(|snapshot| snapshot.cursor);
+        [
+            self.cursor_animating
+                .then_some(self.last_frame + self.frame_interval),
+            cursor
+                .filter(|cursor| {
+                    self.focused
+                        && self.preedit.is_empty()
+                        && cursor.visible
+                        && cursor.blinking
+                        && self.config.cursor.blink
+                })
+                .map(|_| blink_deadline(self.cursor_activity)),
+            self.has_blinking_text
+                .then(|| blink_deadline(self.text_blink_epoch)),
+            self.bell_until,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    pub fn bell(&mut self) {
+        self.bell_until = Some(Instant::now() + Duration::from_millis(120));
+    }
+
+    pub fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
+        self.cursor_activity = Instant::now();
+    }
+
+    pub fn set_preedit(&mut self, text: String) {
+        self.preedit = text;
+        self.preedit_buffer.set_metrics(Metrics::new(
+            self.layout.metrics.font_size,
+            self.layout.metrics.height as f32,
+        ));
+        self.preedit_buffer.set_wrap(Wrap::None);
+        self.preedit_buffer.set_text(
+            &self.preedit,
+            &Attrs::new().family(Family::Name(&self.layout.family)),
+            Shaping::Advanced,
+            None,
+        );
+        self.preedit_buffer
+            .shape_until_scroll(&mut self.layout.font_system, false);
+    }
+
+    pub fn ime_cursor_area(&self) -> (winit::dpi::PhysicalPosition<u32>, PhysicalSize<u32>) {
+        let geometry = self.geometry();
+        let cursor = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.cursor)
+            .unwrap_or_default();
+        let (cursor_x, cursor_y) = geometry.cell_origin(cursor.column, cursor.row);
+        (
+            winit::dpi::PhysicalPosition::new(cursor_x, cursor_y),
+            PhysicalSize::new(geometry.cell_width, geometry.cell_height),
+        )
     }
 
     pub fn mouse_reporting(&self) -> bool {
@@ -265,6 +366,13 @@ impl Renderer {
     pub fn set_snapshot(&mut self, snapshot: TerminalSnapshot) {
         crate::diagnostics::trace("snapshot-layout-start");
         let now = Instant::now();
+        let has_blinking_text = snapshot.cells.iter().any(|cell| cell.blink && !cell.hidden);
+        if has_blinking_text && !self.has_blinking_text {
+            self.text_blink_epoch = now;
+        }
+        self.has_blinking_text = has_blinking_text;
+        self.layout
+            .set_blink_visible(blink_visible(self.text_blink_epoch, now));
         if snapshot.cursor.visible {
             if self.cursor_hidden_at.take().is_some_and(|hidden| {
                 now.saturating_duration_since(hidden) > Duration::from_millis(250)
@@ -319,6 +427,7 @@ impl Renderer {
                 crate::diagnostics::trace("surface-occluded");
                 self.surface_retry = None;
                 self.cursor_animating = false;
+                self.bell_until = None;
                 self.last_frame = Instant::now();
                 return RenderOutcome::Rendered;
             }
@@ -353,6 +462,18 @@ impl Renderer {
             wgpu::MultisampleState::default(),
             None,
         );
+        self.cursor_text_renderer = TextRenderer::new(
+            &mut self.text_atlas,
+            &self.device,
+            wgpu::MultisampleState::default(),
+            None,
+        );
+        self.preedit_renderer = TextRenderer::new(
+            &mut self.text_atlas,
+            &self.device,
+            wgpu::MultisampleState::default(),
+            None,
+        );
     }
 
     fn draw_frame(
@@ -360,6 +481,17 @@ impl Renderer {
         view: &wgpu::TextureView,
         now: Instant,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self
+            .layout
+            .set_blink_visible(blink_visible(self.text_blink_epoch, now))
+        {
+            if let Some(snapshot) = &self.snapshot {
+                if self.layout.shape(snapshot)? {
+                    self.reset_atlas();
+                }
+            }
+            self.text_prepared = false;
+        }
         self.build_rectangles(now);
         if !self.rect_vertices.is_empty() {
             let bytes = bytemuck::cast_slice(&self.rect_vertices);
@@ -417,6 +549,8 @@ impl Renderer {
             self.text_prepared = true;
             self.prepared_geometry = Some(geometry);
         }
+        let cursor_text = self.prepare_cursor_text(now)?;
+        let preedit = self.prepare_preedit()?;
         if let Some(snapshot) = &self.snapshot {
             let changed = self.prepared_graphics.as_ref().is_none_or(|previous| {
                 previous.generation != snapshot.graphics.generation
@@ -479,23 +613,161 @@ impl Renderer {
         self.image_renderer.draw(ImageLayer::BelowText, &mut pass);
         self.text_renderer
             .render(&self.text_atlas, &self.viewport, &mut pass)?;
-        self.image_renderer.draw(ImageLayer::AboveText, &mut pass);
-        if self.background_vertex_count < self.rect_vertices.len() {
+        if self.decoration_vertex_count > self.background_vertex_count {
             pass.set_pipeline(&self.rect_pipeline);
             pass.set_vertex_buffer(0, self.rect_buffer.slice(..));
             pass.draw(
-                self.background_vertex_count as u32..self.rect_vertices.len() as u32,
+                self.background_vertex_count as u32..self.decoration_vertex_count as u32,
                 0..1,
             );
+        }
+        self.image_renderer.draw(ImageLayer::AboveText, &mut pass);
+        if self.decoration_vertex_count < self.rect_vertices.len() {
+            pass.set_pipeline(&self.rect_pipeline);
+            pass.set_vertex_buffer(0, self.rect_buffer.slice(..));
+            pass.draw(
+                self.decoration_vertex_count as u32..self.rect_vertices.len() as u32,
+                0..1,
+            );
+        }
+        if cursor_text {
+            self.cursor_text_renderer
+                .render(&self.text_atlas, &self.viewport, &mut pass)?;
+        }
+        if preedit {
+            self.preedit_renderer
+                .render(&self.text_atlas, &self.viewport, &mut pass)?;
         }
         drop(pass);
         self.queue.submit(Some(encoder.finish()));
         Ok(())
     }
 
+    fn prepare_cursor_text(
+        &mut self,
+        now: Instant,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return Ok(false);
+        };
+        let cursor = snapshot.cursor;
+        if !self.focused
+            || !self.preedit.is_empty()
+            || !cursor.visible
+            || cursor.shape != CursorShape::Block
+            || self.cursor_animating
+            || (cursor.blinking
+                && self.config.cursor.blink
+                && !blink_visible(self.cursor_activity, now))
+        {
+            return Ok(false);
+        }
+        let cell = snapshot
+            .cells
+            .get(usize::from(cursor.row) * usize::from(snapshot.cols) + usize::from(cursor.column));
+        let (cell_width, cell_height) = self.cell_geometry();
+        let width = cell_width * u32::from(cell.map_or(1, |cell| cell.width.max(1)));
+        let left = f32::from(cursor.column) * cell_width as f32;
+        let top = f32::from(cursor.row) * cell_height as f32;
+        let color = cell
+            .and_then(|cell| {
+                if cell.selected {
+                    Some(self.config.colors.selection_background.into())
+                } else {
+                    cell.background
+                }
+            })
+            .unwrap_or(snapshot.background);
+        let glyphs = self
+            .layout
+            .glyphs
+            .iter()
+            .filter(|glyph| {
+                glyph.left < left + width as f32
+                    && glyph.left + glyph.width > left
+                    && glyph.top < top + cell_height as f32
+                    && glyph.top + glyph.height > top
+            })
+            .cloned()
+            .map(|mut glyph| {
+                glyph.color = Some(Color::rgb(color.red, color.green, color.blue));
+                glyph
+            })
+            .collect::<Vec<_>>();
+        if glyphs.is_empty() {
+            return Ok(false);
+        }
+        let geometry = self.geometry();
+        let images = &self.layout.images;
+        self.cursor_text_renderer.prepare_with_custom(
+            &self.device,
+            &self.queue,
+            &mut self.layout.font_system,
+            &mut self.text_atlas,
+            &self.viewport,
+            [TextArea {
+                buffer: &self.layout.empty_buffer,
+                left: geometry.origin_x as f32,
+                top: geometry.origin_y as f32,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: geometry.origin_x as i32 + left as i32,
+                    top: geometry.origin_y as i32 + top as i32,
+                    right: ((geometry.origin_x as f32 + left + width as f32) as i32)
+                        .min((geometry.origin_x + geometry.content_width) as i32),
+                    bottom: ((geometry.origin_y as f32 + top + cell_height as f32) as i32)
+                        .min((geometry.origin_y + geometry.content_height) as i32),
+                },
+                default_color: Color::rgb(color.red, color.green, color.blue),
+                custom_glyphs: &glyphs,
+            }],
+            &mut self.layout.swash_cache,
+            |request| images.get(&request.id).cloned(),
+        )?;
+        Ok(true)
+    }
+
+    fn prepare_preedit(&mut self) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        if self.preedit.is_empty() {
+            return Ok(false);
+        }
+        let geometry = self.geometry();
+        let (position, _) = self.ime_cursor_area();
+        let foreground = self
+            .snapshot
+            .as_ref()
+            .map_or(self.config.colors.foreground.into(), |snapshot| {
+                snapshot.foreground
+            });
+        self.preedit_renderer.prepare(
+            &self.device,
+            &self.queue,
+            &mut self.layout.font_system,
+            &mut self.text_atlas,
+            &self.viewport,
+            [TextArea {
+                buffer: &self.preedit_buffer,
+                left: position.x as f32,
+                top: position.y as f32,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: position.x as i32,
+                    top: position.y as i32,
+                    right: (geometry.origin_x + geometry.content_width) as i32,
+                    bottom: (geometry.origin_y + geometry.content_height) as i32,
+                },
+                default_color: Color::rgb(foreground.red, foreground.green, foreground.blue),
+                custom_glyphs: &[],
+            }],
+            &mut self.layout.swash_cache,
+        )?;
+        Ok(true)
+    }
+
     fn build_rectangles(&mut self, now: Instant) {
         self.rect_vertices.clear();
         self.background_vertex_count = 0;
+        self.decoration_vertex_count = 0;
         let Some(snapshot) = self.snapshot.as_ref() else {
             return;
         };
@@ -528,23 +800,56 @@ impl Renderer {
                         self.surface_config.format.is_srgb(),
                     );
                 }
-                if cell.underline {
+            }
+        }
+        self.background_vertex_count = self.rect_vertices.len();
+        for row in 0..snapshot.rows {
+            for column in 0..snapshot.cols {
+                let index = usize::from(row) * usize::from(snapshot.cols) + usize::from(column);
+                let Some(cell) = snapshot.cells.get(index) else {
+                    continue;
+                };
+                if cell.hidden || (cell.blink && !blink_visible(self.text_blink_epoch, now)) {
+                    continue;
+                }
+                let left = origin[0] + f32::from(column) * cell_width as f32;
+                let top = origin[1] + f32::from(row) * cell_height as f32;
+                let thickness = (self.layout.metrics.font_size / 14.0).round().max(1.0);
+                if cell.underline || cell.underline_style != UnderlineStyle::None {
                     let color = if cell.selected {
                         self.config.colors.selection_foreground.into()
                     } else {
-                        cell.foreground
+                        cell.underline_color.unwrap_or(cell.foreground)
                     };
+                    append_underline(
+                        &mut self.rect_vertices,
+                        [left, top, cell_width as f32, cell_height as f32],
+                        self.layout.metrics.baseline,
+                        thickness,
+                        cell.underline_style,
+                        color,
+                        self.size,
+                        self.surface_config.format.is_srgb(),
+                    );
+                }
+                let color = if cell.selected {
+                    self.config.colors.selection_foreground.into()
+                } else {
+                    cell.foreground
+                };
+                for line_y in [
+                    cell.strikethrough.then_some(
+                        (self.layout.metrics.baseline - self.layout.metrics.font_size * 0.3)
+                            .round(),
+                    ),
+                    cell.overline.then_some(0.0),
+                ]
+                .into_iter()
+                .flatten()
+                {
                     append_rect(
                         &mut self.rect_vertices,
-                        [
-                            origin[0] + f32::from(column) * cell_width as f32,
-                            origin[1]
-                                + f32::from(row) * cell_height as f32
-                                + self.layout.metrics.baseline
-                                + 1.0,
-                            cell_width as f32,
-                            1.0,
-                        ],
+                        [left, top + line_y, cell_width as f32, thickness],
                         color,
                         1.0,
                         self.size,
@@ -580,9 +885,52 @@ impl Renderer {
                 }
             }
         }
-        self.background_vertex_count = self.rect_vertices.len();
+        self.decoration_vertex_count = self.rect_vertices.len();
+        if self.bell_until.is_some_and(|deadline| deadline > now) {
+            append_rect(
+                &mut self.rect_vertices,
+                [0.0, 0.0, self.size.width as f32, self.size.height as f32],
+                snapshot.foreground,
+                0.12,
+                self.size,
+                self.surface_config.format.is_srgb(),
+            );
+        } else {
+            self.bell_until = None;
+        }
         let elapsed = now.saturating_duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
+        if !self.preedit.is_empty() {
+            let cursor = snapshot.cursor;
+            let left = origin[0] + f32::from(cursor.column) * cell_width as f32;
+            let top = origin[1] + f32::from(cursor.row) * cell_height as f32;
+            let width = self
+                .preedit_buffer
+                .layout_runs()
+                .map(|run| run.line_w)
+                .fold(0.0_f32, f32::max)
+                .ceil()
+                .max(cell_width as f32)
+                .min((geometry.origin_x + geometry.content_width) as f32 - left);
+            append_rect(
+                &mut self.rect_vertices,
+                [left, top, width, cell_height as f32],
+                snapshot.background,
+                1.0,
+                self.size,
+                self.surface_config.format.is_srgb(),
+            );
+            append_rect(
+                &mut self.rect_vertices,
+                [left, top + cell_height as f32 - 1.0, width, 1.0],
+                snapshot.foreground,
+                1.0,
+                self.size,
+                self.surface_config.format.is_srgb(),
+            );
+            self.cursor_animating = false;
+            return;
+        }
         if !snapshot.cursor.visible {
             self.cursor_animating = false;
             return;
@@ -592,17 +940,28 @@ impl Renderer {
             CursorShape::Beam => AnimatedCursorShape::Beam,
             CursorShape::Underline => AnimatedCursorShape::Underline,
         };
+        let cursor_width = if snapshot.cursor.shape == CursorShape::Block {
+            snapshot
+                .cells
+                .get(
+                    usize::from(snapshot.cursor.row) * usize::from(snapshot.cols)
+                        + usize::from(snapshot.cursor.column),
+                )
+                .map_or(1, |cell| cell.width.max(1))
+        } else {
+            1
+        };
         let frame = self.cursor_animation.update(
             [
                 origin[0] + f32::from(snapshot.cursor.column) * cell_width as f32,
                 origin[1] + f32::from(snapshot.cursor.row) * cell_height as f32,
-                cell_width as f32,
+                cell_width as f32 * f32::from(cursor_width),
                 cell_height as f32,
             ],
             shape,
             elapsed,
             CursorAnimationOptions {
-                smooth: self.config.cursor.smooth,
+                smooth: self.config.cursor.smooth && self.focused,
                 trail: self.config.cursor.trail,
                 duration_seconds: self.config.cursor.trail_duration_ms as f32 / 1000.0,
                 ..Default::default()
@@ -612,7 +971,8 @@ impl Renderer {
         if frame.animating {
             crate::diagnostics::trace("cursor-animating");
         }
-        let blink_visible = !snapshot.cursor.blinking
+        let blink_visible = !self.focused
+            || !snapshot.cursor.blinking
             || !self.config.cursor.blink
             || (now
                 .saturating_duration_since(self.cursor_activity)
@@ -620,6 +980,28 @@ impl Renderer {
                 / 530)
                 .is_multiple_of(2);
         if blink_visible {
+            if !self.focused && snapshot.cursor.shape == CursorShape::Block {
+                let left = frame.corners[0][0];
+                let top = frame.corners[0][1];
+                let width = cell_width as f32 * f32::from(cursor_width);
+                let height = cell_height as f32;
+                for rect in [
+                    [left, top, width, 1.0],
+                    [left, top + height - 1.0, width, 1.0],
+                    [left, top, 1.0, height],
+                    [left + width - 1.0, top, 1.0, height],
+                ] {
+                    append_rect(
+                        &mut self.rect_vertices,
+                        rect,
+                        snapshot.cursor_color,
+                        1.0,
+                        self.size,
+                        self.surface_config.format.is_srgb(),
+                    );
+                }
+                return;
+            }
             append_quad(
                 &mut self.rect_vertices,
                 frame.corners,
@@ -629,6 +1011,87 @@ impl Renderer {
                 self.surface_config.format.is_srgb(),
             );
         }
+    }
+}
+
+fn blink_visible(epoch: Instant, now: Instant) -> bool {
+    (now.saturating_duration_since(epoch).as_millis() / 530).is_multiple_of(2)
+}
+
+fn blink_deadline(epoch: Instant) -> Instant {
+    let periods = epoch.elapsed().as_millis() / 530 + 1;
+    epoch + Duration::from_millis((periods * 530) as u64)
+}
+
+fn append_underline(
+    vertices: &mut Vec<RectVertex>,
+    cell: [f32; 4],
+    baseline: f32,
+    thickness: f32,
+    style: UnderlineStyle,
+    color: Rgb,
+    size: PhysicalSize<u32>,
+    srgb: bool,
+) {
+    let [left, top, width, height] = cell;
+    let underline_y = (baseline + 1.0).min(height - thickness).max(0.0);
+    match style {
+        UnderlineStyle::Double => {
+            for offset in [(underline_y - 2.0 * thickness).max(0.0), underline_y] {
+                append_rect(
+                    vertices,
+                    [left, top + offset, width, thickness],
+                    color,
+                    1.0,
+                    size,
+                    srgb,
+                );
+            }
+        }
+        UnderlineStyle::Curly | UnderlineStyle::Dotted | UnderlineStyle::Dashed => {
+            for column in 0..width.ceil() as u32 {
+                let phase = (left as u32 + column) % 6;
+                let visible = match style {
+                    UnderlineStyle::Dotted => phase.is_multiple_of(3),
+                    UnderlineStyle::Dashed => phase < 4,
+                    _ => true,
+                };
+                if !visible {
+                    continue;
+                }
+                let wave = if style == UnderlineStyle::Curly {
+                    [0.0, 1.0, 2.0, 2.0, 1.0, 0.0][phase as usize] * thickness
+                } else {
+                    0.0
+                };
+                let offset = if style == UnderlineStyle::Curly {
+                    (underline_y - 2.0 * thickness).max(0.0) + wave
+                } else {
+                    underline_y
+                };
+                append_rect(
+                    vertices,
+                    [
+                        left + column as f32,
+                        top + offset,
+                        1.0_f32.min(width - column as f32),
+                        thickness,
+                    ],
+                    color,
+                    1.0,
+                    size,
+                    srgb,
+                );
+            }
+        }
+        _ => append_rect(
+            vertices,
+            [left, top + underline_y, width, thickness],
+            color,
+            1.0,
+            size,
+            srgb,
+        ),
     }
 }
 
@@ -791,6 +1254,10 @@ mod tests {
     }
 
     fn capture(renderer: &mut Renderer) -> Vec<u8> {
+        capture_at(renderer, Instant::now())
+    }
+
+    fn capture_at(renderer: &mut Renderer, now: Instant) -> Vec<u8> {
         let texture = renderer.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("wisp regression target"),
             size: wgpu::Extent3d {
@@ -808,7 +1275,7 @@ mod tests {
         renderer
             .draw_frame(
                 &texture.create_view(&wgpu::TextureViewDescriptor::default()),
-                Instant::now(),
+                now,
             )
             .expect("draw production frame");
         let stride = (renderer.size.width * 4).div_ceil(256) * 256;
@@ -885,6 +1352,222 @@ mod tests {
     fn pixel(rgba: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
         let offset = (y * width + x) as usize * 4;
         rgba[offset..offset + 4].try_into().expect("RGBA pixel")
+    }
+
+    #[test]
+    fn gpu_renders_colored_underline_styles_strike_overline_and_conceal() {
+        let config = Config::default();
+        let mut renderer = offscreen(config.clone());
+        let mut frame = snapshot(&config, 7, 1);
+        let red = Rgb {
+            red: 255,
+            green: 0,
+            blue: 0,
+        };
+        let green = Rgb {
+            red: 0,
+            green: 255,
+            blue: 0,
+        };
+        let blue = Rgb {
+            red: 0,
+            green: 0,
+            blue: 255,
+        };
+        for (column, style) in [
+            UnderlineStyle::Single,
+            UnderlineStyle::Double,
+            UnderlineStyle::Curly,
+            UnderlineStyle::Dotted,
+            UnderlineStyle::Dashed,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            frame.cells[column].underline_style = style;
+            frame.cells[column].underline_color = Some([red, green, blue, red, green][column]);
+        }
+        frame.cells[5].strikethrough = true;
+        frame.cells[5].overline = true;
+        frame.cells[5].foreground = blue;
+        frame.cells[6].hidden = true;
+        frame.cells[6].underline = true;
+        frame.cells[6].underline_color = Some(red);
+        renderer.set_snapshot(frame);
+        let rgba = capture(&mut renderer);
+        let (width, height) = renderer.cell_geometry();
+        let (origin_x, origin_y) = renderer.geometry().content_origin();
+        let painted = |column: u32| -> Vec<(u32, u32)> {
+            (0..height)
+                .flat_map(|row| (0..width).map(move |offset| (offset, row)))
+                .filter(|(offset, row)| {
+                    pixel(
+                        &rgba,
+                        renderer.size.width,
+                        origin_x + column * width + offset,
+                        origin_y + row,
+                    ) != [0, 0, 0, 255]
+                })
+                .collect()
+        };
+        let rows = |points: &[(u32, u32)]| {
+            points
+                .iter()
+                .map(|(_, row)| *row)
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        };
+        assert_eq!(rows(&painted(0)), 1);
+        assert_eq!(rows(&painted(1)), 2);
+        assert!(rows(&painted(2)) >= 3);
+        for column in [3, 4] {
+            assert!(!painted(column).is_empty() && painted(column).len() < width as usize);
+        }
+        assert_eq!(rows(&painted(5)), 2);
+        assert!(painted(6).is_empty());
+        assert!(painted(0).iter().all(|(column, row)| pixel(
+            &rgba,
+            renderer.size.width,
+            origin_x + column,
+            origin_y + row
+        ) == [255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn blinking_text_changes_only_blinking_cells_and_sleeps_without_blinkers() {
+        let mut config = Config::default();
+        config.font.family = "DejaVu Sans Mono".to_owned();
+        let mut renderer = offscreen(config.clone());
+        let mut frame = snapshot(&config, 2, 1);
+        frame.cells[0].text = "M".to_owned();
+        frame.cells[0].blink = true;
+        frame.cells[1].text = "M".to_owned();
+        renderer.set_snapshot(frame.clone());
+        let epoch = renderer.text_blink_epoch;
+        let on = capture_at(&mut renderer, epoch + Duration::from_millis(100));
+        let off = capture_at(&mut renderer, epoch + Duration::from_millis(600));
+        let (width, height) = renderer.cell_geometry();
+        let (origin_x, origin_y) = renderer.geometry().content_origin();
+        let region = |rgba: &[u8], column: u32| {
+            (0..height)
+                .flat_map(|row| {
+                    (0..width).map(move |offset| {
+                        pixel(
+                            rgba,
+                            512,
+                            origin_x + column * width + offset,
+                            origin_y + row,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(region(&on, 0).iter().any(|pixel| *pixel != [0, 0, 0, 255]));
+        assert!(region(&off, 0).iter().all(|pixel| *pixel == [0, 0, 0, 255]));
+        assert_eq!(region(&on, 1), region(&off, 1));
+        assert!(renderer.next_frame_deadline().is_some());
+        frame.cells[0].blink = false;
+        renderer.set_snapshot(frame);
+        assert!(renderer.next_frame_deadline().is_none());
+    }
+
+    #[test]
+    fn visual_bell_expires_without_a_continuous_redraw_deadline() {
+        let config = Config::default();
+        let mut renderer = offscreen(config.clone());
+        renderer.set_snapshot(snapshot(&config, 1, 1));
+        renderer.bell();
+        let now = Instant::now();
+        let flash = capture_at(&mut renderer, now);
+        assert_ne!(pixel(&flash, 512, 100, 100), [0, 0, 0, 255]);
+        assert!(renderer.next_frame_deadline().is_some());
+        let cleared = capture_at(&mut renderer, now + Duration::from_millis(200));
+        assert_eq!(pixel(&cleared, 512, 100, 100), [0, 0, 0, 255]);
+        assert!(renderer.next_frame_deadline().is_none());
+    }
+
+    #[test]
+    fn block_cursor_preserves_readable_text_and_unfocused_outline() {
+        let mut config = Config::default();
+        config.font.family = "DejaVu Sans Mono".to_owned();
+        config.cursor.smooth = false;
+        let mut renderer = offscreen(config.clone());
+        let mut frame = snapshot(&config, 2, 1);
+        frame.cells[0].text = "M".to_owned();
+        frame.cells[1].text = "M".to_owned();
+        frame.cursor.visible = true;
+        frame.cursor.shape = CursorShape::Block;
+        frame.cursor_color = Rgb {
+            red: 255,
+            green: 0,
+            blue: 0,
+        };
+        renderer.set_snapshot(frame);
+        let focused = capture(&mut renderer);
+        let (width, height) = renderer.cell_geometry();
+        let (origin_x, origin_y) = renderer.geometry().content_origin();
+        let region = |rgba: &[u8]| {
+            (0..height)
+                .flat_map(|row| {
+                    (0..width)
+                        .map(move |column| pixel(rgba, 512, origin_x + column, origin_y + row))
+                })
+                .collect::<Vec<_>>()
+        };
+        let pixels = region(&focused);
+        assert!(pixels.iter().any(|pixel| *pixel == [255, 0, 0, 255]));
+        assert!(
+            pixels
+                .iter()
+                .filter(|pixel| pixel[0] < 100 && pixel[1] == 0 && pixel[2] == 0)
+                .count()
+                > 5,
+            "block cursor erased its glyph"
+        );
+        renderer.set_focused(false);
+        let unfocused = capture(&mut renderer);
+        assert!(
+            region(&unfocused)
+                .iter()
+                .any(|pixel| pixel[0] > 100 && pixel[1] > 100 && pixel[2] > 100)
+        );
+        assert!(renderer.next_frame_deadline().is_none());
+    }
+
+    #[test]
+    fn ime_preedit_is_anchored_to_the_cursor_and_clears_without_changing_grid_text() {
+        let mut config = Config::default();
+        config.font.family = "DejaVu Sans Mono".to_owned();
+        let mut renderer = offscreen(config.clone());
+        let mut frame = snapshot(&config, 12, 3);
+        frame.cells[13].text = "original".to_owned();
+        frame.cursor.column = 1;
+        frame.cursor.row = 1;
+        renderer.set_snapshot(frame);
+        let before = capture(&mut renderer);
+        renderer.set_preedit("é漢".to_owned());
+        let (position, size) = renderer.ime_cursor_area();
+        let geometry = renderer.geometry();
+        assert_eq!((position.x, position.y), geometry.cell_origin(1, 1));
+        assert_eq!((size.width, size.height), renderer.cell_geometry());
+        let composing = capture(&mut renderer);
+        assert_ne!(before, composing);
+        assert_eq!(
+            renderer.snapshot.as_ref().unwrap().cells[13].text,
+            "original"
+        );
+        assert!(
+            !renderer
+                .preedit_buffer
+                .layout_runs()
+                .next()
+                .unwrap()
+                .glyphs
+                .is_empty()
+        );
+        renderer.set_preedit(String::new());
+        assert_eq!(capture(&mut renderer), before);
+        assert!(renderer.next_frame_deadline().is_none());
     }
 
     #[test]

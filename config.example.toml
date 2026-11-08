@@ -49,3 +49,4 @@ kitty_graphics = true
 bracketed_paste = true
 focus_events = true
 hyperlinks = true
+clipboard_write = true

@@ -1,0 +1,53 @@
+diff --git a/src/terminal/Terminal.zig b/src/terminal/Terminal.zig
+index b5cc8ea0f..c5614a1f1 100644
+--- a/src/terminal/Terminal.zig
++++ b/src/terminal/Terminal.zig
+@@ -3475,8 +3475,13 @@ pub fn printAttributes(self: *Terminal, buf: []u8) ![]const u8 {
+     }
+ 
+     for (attrs[0..i]) |c| {
+-        try writer.print(";{c}", .{c});
++        if (c == '4' and pen.flags.underline != .single) {
++            try writer.print(";4:{d}", .{@intFromEnum(pen.flags.underline)});
++        } else {
++            try writer.print(";{c}", .{c});
++        }
+     }
++    if (pen.flags.overline) try writer.writeAll(";53");
+ 
+     switch (pen.fg_color) {
+         .none => {},
+@@ -3500,6 +3505,12 @@ pub fn printAttributes(self: *Terminal, buf: []u8) ![]const u8 {
+         .rgb => |rgb| try writer.print(";48:2::{[r]}:{[g]}:{[b]}", rgb),
+     }
+ 
++    switch (pen.underline_color) {
++        .none => {},
++        .palette => |palette_index| try writer.print(";58:5:{d}", .{palette_index}),
++        .rgb => |rgb| try writer.print(";58:2::{[r]}:{[g]}:{[b]}", rgb),
++    }
++
+     return stream.getWritten();
+ }
+ 
+@@ -12801,6 +12812,20 @@ test "Terminal: printAttributes" {
+     }
+ }
+ 
++test "Terminal: printAttributes standard rendition preserves underline variants overline and underline colors" {
++    const alloc = testing.allocator;
++    var t = try init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++    var storage: [128]u8 = undefined;
++    try t.setAttribute(.{ .underline = .curly });
++    try t.setAttribute(.overline);
++    try t.setAttribute(.{ .underline_color = .{ .r = 12, .g = 34, .b = 56 } });
++    try testing.expectEqualStrings("0;4:3;53;58:2::12:34:56", try t.printAttributes(&storage));
++    try t.setAttribute(.{ .underline = .double });
++    try t.setAttribute(.{ .@"256_underline_color" = 9 });
++    try testing.expectEqualStrings("0;4:2;53;58:5:9", try t.printAttributes(&storage));
++}
++
+ test "Terminal: eraseDisplay simple erase below" {
+     const alloc = testing.allocator;
+     var t = try init(alloc, .{ .rows = 5, .cols = 5 });

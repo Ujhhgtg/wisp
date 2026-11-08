@@ -33,6 +33,16 @@ build script. Wisp changes only:
   reports uniform file errors with regular-file checks before opening.
 - `graphics-geometry.patch` uses clipped source extents for size calculations
   and clamps placement offsets to a cell.
+- `standard-vt.patch` ignores DEL/unused C0 bytes, handles default TBC and ANSI
+  mode reports, and implements DECSTR without erasing text/history or tabs.
+- `standard-dcs.patch` uses the existing DCS parser for DECRQSS and XTGETTCAP
+  in the embedded VT handler, including negative responses.
+- `standard-rendition.patch` reports extended underline styles, underline color,
+  and overline accurately in rendition status responses.
+- `standard-host-reset.patch` restores the host's configured cursor appearance
+  and blink defaults during DECSTR.
+- `standard-performance.patch` allocates DCS state only when needed and skips
+  discarded OSC ASCII in batches while preserving control-byte handling.
 
 The build records the complete patch set in its private Cargo output directory.
 When the patch set changes, only its managed source files are restored to the
@@ -66,3 +76,9 @@ relative placement/storage filters pass 131 tests and the anchor filter passes
 57 tests. Wisp additionally exercises graphics through its real PTY, snapshot,
 GPU, and actual-window paths. Animation state and rendering live in Wisp rather
 than adding incompatible fields to the native image C ABI.
+
+The standard performance changes pass 59 focused OSC/stream tests and 63 DCS
+tests, including every byte value at vector boundaries, input chunk splitting,
+and lazy-allocation failure and recovery. Controlled native comparisons show
+ASCII, Unicode, combining-cell, and CSI throughput within 2% or better than the
+pre-standard baseline; discarded long OSC no longer slows the parser.

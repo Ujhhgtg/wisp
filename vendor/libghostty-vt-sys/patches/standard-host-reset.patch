@@ -1,0 +1,42 @@
+diff --git a/src/terminal/stream_terminal.zig b/src/terminal/stream_terminal.zig
+index 814a28e7d..67a021e6e 100644
+--- a/src/terminal/stream_terminal.zig
++++ b/src/terminal/stream_terminal.zig
+@@ -275,7 +275,12 @@ pub const Handler = struct {
+                 self.terminal.modes.set(.cursor_blinking, self.default_cursor_blink);
+                 self.terminal.screens.active.cursor.cursor_style = self.default_cursor_style;
+             },
+-            .soft_reset => self.terminal.softReset(),
++            .soft_reset => {
++                self.terminal.softReset();
++                self.default_cursor = true;
++                self.terminal.modes.set(.cursor_blinking, self.default_cursor_blink);
++                self.terminal.screens.active.cursor.cursor_style = self.default_cursor_style;
++            },
+             .start_hyperlink => try self.terminal.screens.active.startHyperlink(value.uri, value.id),
+             .end_hyperlink => self.terminal.screens.active.endHyperlink(),
+             .semantic_prompt => try self.terminal.semanticPrompt(value),
+@@ -2025,6 +2030,23 @@ test "standard DCS query replies expose current state and known capabilities" {
+     try testing.expectEqualStrings("\x1bP1+r436F=323536\x1b\\\x1bP1+r524742=38\x1b\\\x1bP0+r776973702D6E6F6E6578697374656E74\x1b\\", Capture.response[0..Capture.length]);
+ }
+ 
++test "standard host reset restores configured cursor appearance" {
++    var t: Terminal = try .init(testing.allocator, .{ .cols = 24, .rows = 6 });
++    defer t.deinit(testing.allocator);
++    var handler: Handler = .init(&t);
++    handler.default_cursor_style = .bar;
++    handler.default_cursor_blink = true;
++    var s: Stream = .initAlloc(testing.allocator, handler);
++    defer s.deinit();
++    s.nextSlice("\x1b[2 q");
++    try testing.expectEqual(Screen.CursorStyle.block, t.screens.active.cursor.cursor_style);
++    try testing.expect(!t.modes.get(.cursor_blinking));
++    s.nextSlice("\x1b[!p");
++    try testing.expectEqual(Screen.CursorStyle.bar, t.screens.active.cursor.cursor_style);
++    try testing.expect(t.modes.get(.cursor_blinking));
++    try testing.expect(s.handler.default_cursor);
++}
++
+ test "stream: CSI W with intermediate but no params" {
+     // Regression test from AFL++ crash. CSI ? W without
+     // parameters caused an out-of-bounds access on input.params[0].

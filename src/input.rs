@@ -123,12 +123,25 @@ impl InputState {
         text: Option<String>,
         unshifted: Option<char>,
     ) -> Result<InputResult, Error> {
+        if terminal.mode(Mode::KAM)? {
+            return Ok(InputResult::default());
+        }
+        let legacy =
+            !config.protocols.kitty_keyboard || terminal.kitty_keyboard_flags()?.is_empty();
         self.key_encoder.set_options_from_terminal(terminal);
         if !config.protocols.kitty_keyboard {
             self.key_encoder.set_kitty_flags(KittyKeyFlags::DISABLED);
         }
+        let (encoded_key, encoded_mods) = if legacy {
+            legacy_function_key(key, mods)
+        } else {
+            (key, mods)
+        };
         let mut event = key::Event::new()?;
-        event.set_key(key).set_mods(mods).set_action(action);
+        event
+            .set_key(encoded_key)
+            .set_mods(encoded_mods)
+            .set_action(action);
         let text = text.filter(|text| !text.chars().any(char::is_control));
         let unshifted = unshifted
             .or_else(|| text.as_ref()?.chars().next()?.to_lowercase().next())
@@ -139,6 +152,22 @@ impl InputState {
         }
         let mut result = InputResult::default();
         self.key_encoder.encode_to_vec(&event, &mut result.bytes)?;
+        if legacy {
+            if let Some(alias) = legacy_control_alias(&result.bytes) {
+                result.bytes.clear();
+                result.bytes.extend_from_slice(alias);
+            } else if encoded_key == key::Key::F3
+                && let Some(modifier) = result
+                    .bytes
+                    .strip_prefix(b"\x1b[13;")
+                    .and_then(|sequence| sequence.strip_suffix(b"~"))
+            {
+                let mut encoded = b"\x1b[1;".to_vec();
+                encoded.extend_from_slice(modifier);
+                encoded.push(b'R');
+                result.bytes = encoded;
+            }
+        }
         if !result.bytes.is_empty() && action != key::Action::Release {
             let selection_changed = self.clear_selection(terminal)?;
             let scrollbar = terminal.scrollbar()?;
@@ -151,6 +180,17 @@ impl InputState {
     }
 
     pub fn text(
+        &mut self,
+        terminal: &mut Terminal<'static, '_>,
+        text: Vec<u8>,
+    ) -> Result<InputResult, Error> {
+        if terminal.mode(Mode::KAM)? {
+            return Ok(InputResult::default());
+        }
+        self.input_bytes(terminal, text)
+    }
+
+    fn input_bytes(
         &mut self,
         terminal: &mut Terminal<'static, '_>,
         text: Vec<u8>,
@@ -177,7 +217,7 @@ impl InputState {
         let mut output = vec![0; input.len().saturating_add(12)];
         let length = libghostty_vt::paste::encode(&mut input, bracketed, &mut output)?;
         output.truncate(length);
-        self.text(terminal, output)
+        self.input_bytes(terminal, output)
     }
 
     pub fn focus(&self, terminal: &Terminal<'_, '_>, focused: bool) -> Result<InputResult, Error> {
@@ -782,7 +822,15 @@ fn over_grid(
 fn real_button(button: Option<mouse::Button>) -> bool {
     matches!(
         button,
-        Some(mouse::Button::Left | mouse::Button::Middle | mouse::Button::Right)
+        Some(
+            mouse::Button::Left
+                | mouse::Button::Middle
+                | mouse::Button::Right
+                | mouse::Button::Eight
+                | mouse::Button::Nine
+                | mouse::Button::Ten
+                | mouse::Button::Eleven
+        )
     )
 }
 
@@ -809,6 +857,74 @@ fn physical_codepoint(key: key::Key) -> Option<char> {
         key::Key::Slash => Some('/'),
         _ => None,
     }
+}
+
+pub fn map_numpad_key(
+    physical: winit::keyboard::KeyCode,
+    logical: &winit::keyboard::Key,
+) -> Option<key::Key> {
+    use winit::keyboard::{Key, KeyCode, NamedKey};
+    if !matches!(
+        physical,
+        KeyCode::Numpad0
+            | KeyCode::Numpad1
+            | KeyCode::Numpad2
+            | KeyCode::Numpad3
+            | KeyCode::Numpad4
+            | KeyCode::Numpad5
+            | KeyCode::Numpad6
+            | KeyCode::Numpad7
+            | KeyCode::Numpad8
+            | KeyCode::Numpad9
+            | KeyCode::NumpadDecimal
+    ) {
+        return None;
+    }
+    Some(match logical {
+        Key::Named(NamedKey::ArrowUp) => key::Key::NumpadUp,
+        Key::Named(NamedKey::ArrowDown) => key::Key::NumpadDown,
+        Key::Named(NamedKey::ArrowLeft) => key::Key::NumpadLeft,
+        Key::Named(NamedKey::ArrowRight) => key::Key::NumpadRight,
+        Key::Named(NamedKey::Home) => key::Key::NumpadHome,
+        Key::Named(NamedKey::End) => key::Key::NumpadEnd,
+        Key::Named(NamedKey::PageUp) => key::Key::NumpadPageUp,
+        Key::Named(NamedKey::PageDown) => key::Key::NumpadPageDown,
+        Key::Named(NamedKey::Insert) => key::Key::NumpadInsert,
+        Key::Named(NamedKey::Delete) => key::Key::NumpadDelete,
+        Key::Named(NamedKey::Clear) => key::Key::NumpadBegin,
+        _ => return None,
+    })
+}
+
+fn legacy_control_alias(encoded: &[u8]) -> Option<&'static [u8]> {
+    match encoded {
+        b"\x1b[105;5u" => Some(b"\t"),
+        b"\x1b[109;5u" => Some(b"\r"),
+        b"\x1b[91;5u" => Some(b"\x1b"),
+        b"\x1b[105;7u" => Some(b"\x1b\t"),
+        b"\x1b[109;7u" => Some(b"\x1b\r"),
+        b"\x1b[91;7u" => Some(b"\x1b\x1b"),
+        _ => None,
+    }
+}
+
+fn legacy_function_key(key: key::Key, mods: key::Mods) -> (key::Key, key::Mods) {
+    let key = match key {
+        key::Key::F13 => key::Key::F1,
+        key::Key::F14 => key::Key::F2,
+        key::Key::F15 => key::Key::F3,
+        key::Key::F16 => key::Key::F4,
+        key::Key::F17 => key::Key::F5,
+        key::Key::F18 => key::Key::F6,
+        key::Key::F19 => key::Key::F7,
+        key::Key::F20 => key::Key::F8,
+        key::Key::F21 => key::Key::F9,
+        key::Key::F22 => key::Key::F10,
+        key::Key::F23 => key::Key::F11,
+        key::Key::F24 => key::Key::F12,
+        _ => return (key, mods),
+    };
+    (key, mods | key::Mods::SHIFT)
 }
 
 #[cfg(test)]

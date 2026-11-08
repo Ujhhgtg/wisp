@@ -1,0 +1,215 @@
+diff --git a/src/terminal/Terminal.zig b/src/terminal/Terminal.zig
+index 4ae447d77..b5cc8ea0f 100644
+--- a/src/terminal/Terminal.zig
++++ b/src/terminal/Terminal.zig
+@@ -3887,6 +3887,35 @@ pub fn plainStringUnwrapped(self: *Terminal, alloc: Allocator) ![]const u8 {
+     return try self.screens.active.dumpStringAllocUnwrapped(alloc, .{ .viewport = .{} });
+ }
+ 
++pub fn softReset(self: *Terminal) void {
++    self.modes.set(.cursor_visible, true);
++    self.modes.set(.insert, false);
++    self.modes.set(.origin, false);
++    self.modes.set(.disable_keyboard, false);
++    self.modes.set(.keypad_keys, false);
++    self.modes.set(.cursor_keys, false);
++    self.modes.set(.wraparound, self.modes.default.wraparound);
++    self.modes.set(.reverse_wrap, false);
++    self.modes.set(.reverse_wrap_extended, false);
++    self.modes.set(.enable_left_and_right_margin, false);
++    self.modes.set(.synchronized_output, false);
++    self.screens.active.setAttribute(.unset) catch unreachable;
++    self.screens.active.cursor.protected = false;
++    self.screens.active.cursor.pending_wrap = false;
++    self.screens.active.protected_mode = .off;
++    self.screens.active.charset = .{};
++    self.screens.active.saved_cursor = null;
++    self.previous_char = null;
++    self.status_display = .main;
++    self.scrolling_region = .{
++        .top = 0,
++        .bottom = self.rows - 1,
++        .left = 0,
++        .right = self.cols - 1,
++    };
++    self.flags.dirty.clear = true;
++}
++
+ /// Full reset.
+ ///
+ /// This will attempt to free the existing screen memory but if that fails
+diff --git a/src/terminal/stream.zig b/src/terminal/stream.zig
+index efb06ecdc..3b11c4fe0 100644
+--- a/src/terminal/stream.zig
++++ b/src/terminal/stream.zig
+@@ -127,6 +127,7 @@ pub const Action = union(Key) {
+     kitty_color_report: kitty.color.OSC,
+     color_operation: ColorOperation,
+     semantic_prompt: SemanticPrompt,
++    soft_reset,
+ 
+     pub const Key = lib.Enum(
+         lib.target,
+@@ -226,6 +227,7 @@ pub const Action = union(Key) {
+             "kitty_color_report",
+             "color_operation",
+             "semantic_prompt",
++            "soft_reset",
+         },
+     );
+ 
+@@ -572,15 +574,15 @@ pub fn Stream(comptime H: type) type {
+                 var i: usize = 0;
+                 while (i < cps.len) {
+                     const cp = cps[i];
+-                    if (cp <= 0xF) {
++                    if (cp <= 0x1F or cp == 0x7F) {
+                         @branchHint(.unlikely);
+-                        self.execute(@intCast(cp));
++                        if (cp <= 0xF) self.execute(@intCast(cp));
+                         i += 1;
+                         continue;
+                     }
+ 
+                     var end = i + 1;
+-                    while (end < cps.len and cps[end] > 0xF) end += 1;
++                    while (end < cps.len and cps[end] > 0x1F and cps[end] != 0x7F) end += 1;
+                     self.handler.vt(.print_slice, .{ .cps = cps[i..end] });
+                     i = end;
+                 }
+@@ -874,9 +876,9 @@ pub fn Stream(comptime H: type) type {
+             @setEvalBranchQuota(100_000);
+ 
+             // C0 control
+-            if (c <= 0xF) {
++            if ((c <= 0x1F and c != 0x1B) or c == 0x7F) {
+                 @branchHint(.unlikely);
+-                self.execute(@intCast(c));
++                if (c <= 0xF) self.execute(@intCast(c));
+                 return;
+             }
+             // ESC
+@@ -1652,6 +1654,7 @@ pub fn Stream(comptime H: type) type {
+                 'g' => switch (input.intermediates.len) {
+                     0 => {
+                         const mode: csi.TabClear = switch (input.params.len) {
++                            0 => .current,
+                             1 => std.meta.intToEnum(csi.TabClear, input.params[0]) catch {
+                                 log.warn("invalid tab clear mode: {}", .{input.params[0]});
+                                 return;
+@@ -1857,7 +1860,11 @@ pub fn Stream(comptime H: type) type {
+ 
+                 // DECRQM - Request Mode
+                 'p' => switch (input.intermediates.len) {
+-                    2 => decrqm: {
++                    1, 2 => decrqm: {
++                        if (input.intermediates.len == 1 and input.intermediates[0] == '!') {
++                            if (input.params.len == 0) self.handler.vt(.soft_reset, {});
++                            break :decrqm;
++                        }
+                         const ansi_mode = ansi: {
+                             switch (input.intermediates.len) {
+                                 1 => if (input.intermediates[0] == '$') break :ansi true,
+diff --git a/src/terminal/stream_terminal.zig b/src/terminal/stream_terminal.zig
+index 91cfb21cf..1b29ca693 100644
+--- a/src/terminal/stream_terminal.zig
++++ b/src/terminal/stream_terminal.zig
+@@ -271,6 +271,7 @@ pub const Handler = struct {
+                 self.terminal.modes.set(.cursor_blinking, self.default_cursor_blink);
+                 self.terminal.screens.active.cursor.cursor_style = self.default_cursor_style;
+             },
++            .soft_reset => self.terminal.softReset(),
+             .start_hyperlink => try self.terminal.screens.active.startHyperlink(value.uri, value.id),
+             .end_hyperlink => self.terminal.screens.active.endHyperlink(),
+             .semantic_prompt => try self.terminal.semanticPrompt(value),
+@@ -1846,6 +1847,78 @@ test "request mode DECRQM with write_pty callback" {
+     }
+ }
+ 
++test "standard VT default TBC and DEL preserve terminal cells" {
++    var t: Terminal = try .init(testing.allocator, .{ .cols = 24, .rows = 4 });
++    defer t.deinit(testing.allocator);
++    var s: Stream = .initAlloc(testing.allocator, .init(&t));
++    defer s.deinit();
++
++    s.nextSlice("A\x7fB\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1c\x1d\x1e\x1fC");
++    try testing.expectEqual(@as(usize, 3), t.screens.active.cursor.x);
++    const text = try t.plainString(testing.allocator);
++    defer testing.allocator.free(text);
++    try testing.expectEqualStrings("ABC", text);
++    s.nextSlice("\x1b[3g\x1b[5G\x1bH\x1b[9G\x1bH\x1b[5G\x1b[g\r\t");
++    try testing.expectEqual(@as(usize, 8), t.screens.active.cursor.x);
++    s.next('\x7f');
++    try testing.expectEqual(@as(usize, 8), t.screens.active.cursor.x);
++}
++
++test "standard VT ANSI mode queries report known and unknown modes" {
++    var t: Terminal = try .init(testing.allocator, .{ .cols = 24, .rows = 4 });
++    defer t.deinit(testing.allocator);
++    const Capture = struct {
++        var response: [64]u8 = undefined;
++        var length: usize = 0;
++        fn writePty(_: *Handler, data: [:0]const u8) void {
++            @memcpy(response[0..data.len], data);
++            length = data.len;
++        }
++    };
++    var handler: Handler = .init(&t);
++    handler.effects.write_pty = &Capture.writePty;
++    var s: Stream = .initAlloc(testing.allocator, handler);
++    defer s.deinit();
++    s.nextSlice("\x1b[4$p");
++    try testing.expectEqualStrings("\x1b[4;2$y", Capture.response[0..Capture.length]);
++    s.nextSlice("\x1b[4h\x1b[4$p");
++    try testing.expectEqualStrings("\x1b[4;1$y", Capture.response[0..Capture.length]);
++    s.nextSlice("\x1b[9999$p");
++    try testing.expectEqualStrings("\x1b[9999;0$y", Capture.response[0..Capture.length]);
++}
++
++test "standard VT DECSTR preserves position text history and tabs" {
++    var t: Terminal = try .init(testing.allocator, .{ .cols = 24, .rows = 6 });
++    defer t.deinit(testing.allocator);
++    var s: Stream = .initAlloc(testing.allocator, .init(&t));
++    defer s.deinit();
++    s.nextSlice("KEEP\x1b[3g\x1b[6G\x1bH\x1b[3;7H\x1b7\x1b[1;31m\x1b[4h\x1b[?6h\x1b[?25l\x1b[2;5r\x1b[?69h\x1b[4;18s\x1b[1\"q\x1b(0\x1b[4;10H");
++    const x = t.screens.active.cursor.x;
++    const y = t.screens.active.cursor.y;
++    s.nextSlice("\x1b[!p");
++    try testing.expectEqual(x, t.screens.active.cursor.x);
++    try testing.expectEqual(y, t.screens.active.cursor.y);
++    try testing.expect(t.modes.get(.cursor_visible));
++    try testing.expect(!t.modes.get(.insert));
++    try testing.expect(!t.modes.get(.origin));
++    try testing.expect(!t.modes.get(.enable_left_and_right_margin));
++    try testing.expect(t.modes.get(.wraparound));
++    try testing.expect(t.screens.active.cursor.style.default());
++    try testing.expect(!t.screens.active.cursor.protected);
++    try testing.expectEqual(@as(usize, 0), t.scrolling_region.top);
++    try testing.expectEqual(@as(usize, 5), t.scrolling_region.bottom);
++    try testing.expectEqual(@as(usize, 0), t.scrolling_region.left);
++    try testing.expectEqual(@as(usize, 23), t.scrolling_region.right);
++    const text = try t.plainString(testing.allocator);
++    defer testing.allocator.free(text);
++    try testing.expectEqualStrings("KEEP", text);
++    s.nextSlice("\x1b8");
++    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.x);
++    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.y);
++    s.nextSlice("\t");
++    try testing.expectEqual(@as(usize, 5), t.screens.active.cursor.x);
++}
++
+ test "stream: CSI W with intermediate but no params" {
+     // Regression test from AFL++ crash. CSI ? W without
+     // parameters caused an out-of-bounds access on input.params[0].
+diff --git a/src/termio/stream_handler.zig b/src/termio/stream_handler.zig
+index 43c5d6117..712bff814 100644
+--- a/src/termio/stream_handler.zig
++++ b/src/termio/stream_handler.zig
+@@ -270,6 +270,7 @@ pub const StreamHandler = struct {
+             .next_line => try self.nextLine(),
+             .reverse_index => try self.reverseIndex(),
+             .full_reset => try self.fullReset(),
++            .soft_reset => self.terminal.softReset(),
+             .set_mode => try self.setMode(value.mode, true),
+             .reset_mode => try self.setMode(value.mode, false),
+             .save_mode => self.terminal.modes.save(value.mode),

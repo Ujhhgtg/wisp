@@ -1,0 +1,244 @@
+diff --git a/src/terminal/stream.zig b/src/terminal/stream.zig
+index 3b11c4fe0..fae5fcf2c 100644
+--- a/src/terminal/stream.zig
++++ b/src/terminal/stream.zig
+@@ -670,6 +670,13 @@ pub fn Stream(comptime H: type) type {
+                         // The next byte exits the string state; let
+                         // nextNonUtf8 below handle it.
+                     }
++
++                    if (self.parser.state == .osc_string and
++                        self.parser.osc_parser.state == .invalid)
++                    {
++                        offset += self.consumeInvalidOscString(input[offset..]);
++                        if (offset >= input.len) return input.len;
++                    }
+                 }
+ 
+                 self.nextNonUtf8(input[offset]);
+@@ -824,6 +831,26 @@ pub fn Stream(comptime H: type) type {
+             return end;
+         }
+ 
++        fn consumeInvalidOscString(self: *Self, input: []const u8) usize {
++            comptime assert(!@hasDecl(T, "vtRaw"));
++            assert(self.parser.state == .osc_string);
++            assert(self.parser.osc_parser.state == .invalid);
++
++            var end: usize = 0;
++            if (comptime std.simd.suggestVectorLength(u8)) |vector_len| {
++                const ByteVector = @Vector(vector_len, u8);
++                while (end + vector_len <= input.len) {
++                    const bytes: ByteVector = input[end..][0..vector_len].*;
++                    const invalid = (bytes < @as(ByteVector, @splat(0x20))) |
++                        (bytes >= @as(ByteVector, @splat(0x80)));
++                    if (@reduce(.Or, invalid)) break;
++                    end += vector_len;
++                }
++            }
++            while (end < input.len and input[end] >= 0x20 and input[end] < 0x80) end += 1;
++            return end;
++        }
++
+         /// Like nextSlice but takes one byte and is necessarily a scalar
+         /// operation that can't use SIMD. Prefer nextSlice if you can and
+         /// try to get multiple bytes at once.
+@@ -3965,3 +3992,86 @@ test "stream: apc vector boundaries match scalar path" {
+         );
+     };
+ }
++
++const InvalidOscTestHandler = struct {
++    printed: [512]u32 = @splat(0),
++    printed_len: usize = 0,
++    title: [128]u8 = @splat(0),
++    title_len: usize = 0,
++    bells: usize = 0,
++
++    pub fn vt(
++        self: *@This(),
++        comptime action: Action.Tag,
++        value: Action.Value(action),
++    ) void {
++        switch (action) {
++            .print => {
++                self.printed[self.printed_len] = value.cp;
++                self.printed_len += 1;
++            },
++            .print_slice => {
++                @memcpy(self.printed[self.printed_len..][0..value.cps.len], value.cps);
++                self.printed_len += value.cps.len;
++            },
++            .window_title => {
++                @memset(&self.title, 0);
++                @memcpy(self.title[0..value.title.len], value.title);
++                self.title_len = value.title.len;
++            },
++            .bell => self.bells += 1,
++            else => {},
++        }
++    }
++};
++
++test "stream: invalid OSC preserves terminators and cancellation" {
++    const endings = [_][]const u8{ "\x07", "\x1b\\", "\x18", "\x1a" };
++    for (endings) |ending| {
++        var parser: Stream(InvalidOscTestHandler) = .init(.{});
++        parser.nextSlice("\x1b]6;" ++ "discarded ASCII payload " ** 8);
++        try testing.expectEqual(.osc_string, parser.parser.state);
++        try testing.expectEqual(.invalid, parser.parser.osc_parser.state);
++        parser.nextSlice(ending);
++        parser.nextSlice("\x1b]2;ready\x07END");
++        try testing.expectEqual(.ground, parser.parser.state);
++        try testing.expectEqualStrings("ready", parser.handler.title[0..parser.handler.title_len]);
++        try testing.expectEqualSlices(u32, &.{ 'E', 'N', 'D' }, parser.handler.printed[0..parser.handler.printed_len]);
++        try testing.expectEqual(@as(usize, 0), parser.handler.bells);
++    }
++}
++
++test "stream: invalid OSC vector boundaries preserve every byte" {
++    const positions = [_]usize{ 15, 16, 17, 31, 32, 33, 63, 64, 65 };
++    for (positions) |position| for (0..256) |byte| {
++        var input: [128]u8 = undefined;
++        input[0..4].* = "\x1b]6;".*;
++        @memset(input[4 .. 4 + position], 'x');
++        input[4 + position] = @intCast(byte);
++        const suffix = "\x07\x1b]2;ready\x1b\\END";
++        @memcpy(input[5 + position ..][0..suffix.len], suffix);
++        const bytes = input[0 .. 5 + position + suffix.len];
++
++        var bulk: Stream(InvalidOscTestHandler) = .init(.{});
++        bulk.nextSlice(bytes);
++        var scalar: Stream(InvalidOscTestHandler) = .init(.{});
++        for (bytes) |value| scalar.next(value);
++        try testing.expectEqual(scalar.parser.state, bulk.parser.state);
++        try testing.expectEqualDeep(scalar.handler, bulk.handler);
++    };
++}
++
++test "stream: invalid OSC input chunk boundaries match scalar path" {
++    const bytes = "\x1b]6;" ++ "discarded payload " ** 8 ++
++        "\x7f\x00\x08\xc3\xa9\x1b\\\x1b]2;ready\x07END";
++    var scalar: Stream(InvalidOscTestHandler) = .init(.{});
++    for (bytes) |byte| scalar.next(byte);
++
++    for (0..bytes.len + 1) |split| {
++        var bulk: Stream(InvalidOscTestHandler) = .init(.{});
++        bulk.nextSlice(bytes[0..split]);
++        bulk.nextSlice(bytes[split..]);
++        try testing.expectEqual(scalar.parser.state, bulk.parser.state);
++        try testing.expectEqualDeep(scalar.handler, bulk.handler);
++    }
++}
+diff --git a/src/terminal/stream_terminal.zig b/src/terminal/stream_terminal.zig
+index 67a021e6e..b4b40cbf4 100644
+--- a/src/terminal/stream_terminal.zig
++++ b/src/terminal/stream_terminal.zig
+@@ -47,7 +47,7 @@ pub const Handler = struct {
+     /// to send commands to the terminal emulator. This is used by
+     /// the kitty graphics protocol.
+     apc_handler: apc.Handler = .{},
+-    dcs_handler: dcs.Handler = .{},
++    dcs_handler: ?*dcs.Handler = null,
+ 
+     /// Default cursor style used by DECSCUSR reset (CSI 0 q).
+     default_cursor: bool = true,
+@@ -139,7 +139,10 @@ pub const Handler = struct {
+ 
+     pub fn deinit(self: *Handler) void {
+         self.apc_handler.deinit();
+-        self.dcs_handler.deinit();
++        if (self.dcs_handler) |handler| {
++            handler.deinit();
++            self.terminal.gpa().destroy(handler);
++        }
+     }
+ 
+     pub fn vt(
+@@ -308,20 +311,31 @@ pub const Handler = struct {
+             .xtversion => self.reportXtversion(),
+             .clipboard_contents => try self.clipboardContents(value.kind, value.data),
+ 
+-            .dcs_hook => if (self.dcs_handler.hook(self.terminal.gpa(), value)) |command| {
+-                var owned = command;
+-                defer owned.deinit();
+-                try self.dcsCommand(&owned);
++            .dcs_hook => {
++                if (self.dcs_handler == null) {
++                    const handler = try self.terminal.gpa().create(dcs.Handler);
++                    handler.* = .{};
++                    self.dcs_handler = handler;
++                }
++                if (self.dcs_handler.?.hook(self.terminal.gpa(), value)) |command| {
++                    var owned = command;
++                    defer owned.deinit();
++                    try self.dcsCommand(&owned);
++                }
+             },
+-            .dcs_put => if (self.dcs_handler.put(value)) |command| {
+-                var owned = command;
+-                defer owned.deinit();
+-                try self.dcsCommand(&owned);
++            .dcs_put => if (self.dcs_handler) |handler| {
++                if (handler.put(value)) |command| {
++                    var owned = command;
++                    defer owned.deinit();
++                    try self.dcsCommand(&owned);
++                }
+             },
+-            .dcs_unhook => if (self.dcs_handler.unhook()) |command| {
+-                var owned = command;
+-                defer owned.deinit();
+-                try self.dcsCommand(&owned);
++            .dcs_unhook => if (self.dcs_handler) |handler| {
++                if (handler.unhook()) |command| {
++                    var owned = command;
++                    defer owned.deinit();
++                    try self.dcsCommand(&owned);
++                }
+             },
+ 
+             // Have no terminal-modifying effect
+@@ -2030,6 +2044,42 @@ test "standard DCS query replies expose current state and known capabilities" {
+     try testing.expectEqualStrings("\x1bP1+r436F=323536\x1b\\\x1bP1+r524742=38\x1b\\\x1bP0+r776973702D6E6F6E6578697374656E74\x1b\\", Capture.response[0..Capture.length]);
+ }
+ 
++test "standard DCS allocation stays lazy and recovers from failure" {
++    var t: Terminal = try .init(testing.allocator, .{ .cols = 24, .rows = 6 });
++    defer t.deinit(testing.allocator);
++    const Capture = struct {
++        var response: [256]u8 = undefined;
++        var length: usize = 0;
++        fn writePty(_: *Handler, data: [:0]const u8) void {
++            @memcpy(response[length..][0..data.len], data);
++            length += data.len;
++        }
++    };
++    Capture.length = 0;
++    var handler: Handler = .init(&t);
++    handler.effects.write_pty = &Capture.writePty;
++    var parser: Stream = .initAlloc(testing.allocator, handler);
++    defer parser.deinit();
++    parser.nextSlice("hello\x1b[0m\x1b]2;title\x07");
++    try testing.expectEqual(@as(?*dcs.Handler, null), parser.handler.dcs_handler);
++    {
++        const allocator = t.screens.active.alloc;
++        t.screens.active.alloc = testing.failing_allocator;
++        defer t.screens.active.alloc = allocator;
++        parser.nextSlice("\x1bP$qm\x1b\\");
++    }
++    try testing.expectEqual(@as(usize, 0), Capture.length);
++    try testing.expectEqual(@as(?*dcs.Handler, null), parser.handler.dcs_handler);
++    parser.nextSlice("\x1bP$qm\x1b\\");
++    try testing.expectEqualStrings("\x1bP1$r0m\x1b\\", Capture.response[0..Capture.length]);
++    const allocated = parser.handler.dcs_handler;
++    try testing.expect(allocated != null);
++    Capture.length = 0;
++    parser.nextSlice("\x1bP$qz\x1b\\");
++    try testing.expectEqualStrings("\x1bP0$r\x1b\\", Capture.response[0..Capture.length]);
++    try testing.expectEqual(allocated, parser.handler.dcs_handler);
++}
++
+ test "standard host reset restores configured cursor appearance" {
+     var t: Terminal = try .init(testing.allocator, .{ .cols = 24, .rows = 6 });
+     defer t.deinit(testing.allocator);

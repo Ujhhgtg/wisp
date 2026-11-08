@@ -23,6 +23,7 @@ winit = { version = "0.30.12", features = ["rwh_06", "x11", "wayland"] }
 [dev-dependencies]
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
 
 [patch.crates-io]
 libghostty-vt = { path = "vendor/libghostty-vt" }

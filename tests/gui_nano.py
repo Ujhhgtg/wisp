@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import time
 
-from gui_smoke import ROOT, clients, dispatch, run, wait_for
+from gui_smoke import ROOT, clients, dispatch, run, set_window_property, wait_for
 
 
 def main():
@@ -14,6 +14,14 @@ def main():
     log_path = artifacts / "nano-animation.log"
     active = json.loads(run("hyprctl", "activewindow", "-j").stdout).get("address")
     monitor = next(monitor for monitor in json.loads(run("hyprctl", "monitors", "-j").stdout) if monitor["focused"])
+    try:
+        verify_nano(log_path, monitor)
+    finally:
+        if active:
+            dispatch("focuswindow", "address:" + active)
+
+
+def verify_nano(log_path, monitor):
     with tempfile.TemporaryDirectory(prefix="wisp-nano-") as temporary:
         directory = Path(temporary)
         config = directory / "config.toml"
@@ -32,6 +40,12 @@ def main():
                 address = "address:" + client["address"]
                 if not client["floating"]:
                     dispatch("togglefloating", address)
+                for name, value in [
+                    ("opacity", "1"), ("opacity_inactive", "1"),
+                    ("opacity_override", "true"), ("opacity_inactive_override", "true"),
+                    ("rounding", "0"), ("no_anim", "true"),
+                ]:
+                    set_window_property(address, name, value)
                 dispatch("resizewindowpixel", "exact 900 500," + address)
                 dispatch("movewindowpixel", "exact 100 100," + address)
                 dispatch("focuswindow", address)
@@ -50,8 +64,6 @@ def main():
             finally:
                 process.terminate()
                 process.wait(timeout=5)
-    if active:
-        dispatch("focuswindow", "address:" + active)
 
 
 if __name__ == "__main__":

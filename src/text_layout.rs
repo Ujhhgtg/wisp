@@ -24,6 +24,7 @@ struct RunStyle {
     foreground: Rgb,
     bold: bool,
     italic: bool,
+    hidden: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +55,7 @@ pub(super) struct TextLayout {
     pub shaped_rows: usize,
     ligatures: bool,
     selection_foreground: Rgb,
+    blink_visible: bool,
 }
 
 impl TextLayout {
@@ -85,7 +87,23 @@ impl TextLayout {
             shaped_rows: 0,
             ligatures: config.font.ligatures,
             selection_foreground: config.colors.selection_foreground.into(),
+            blink_visible: true,
         })
+    }
+
+    pub fn set_blink_visible(&mut self, visible: bool) -> bool {
+        if self.blink_visible == visible {
+            return false;
+        }
+        self.blink_visible = visible;
+        let mut changed = false;
+        for row in &mut self.rows {
+            if row.cells.iter().any(|cell| cell.blink && !cell.hidden) {
+                row.cells.clear();
+                changed = true;
+            }
+        }
+        changed
     }
 
     pub fn shape(&mut self, snapshot: &TerminalSnapshot) -> Result<bool, String> {
@@ -128,6 +146,7 @@ impl TextLayout {
                     },
                     bold: cell.bold,
                     italic: cell.italic,
+                    hidden: cell.hidden || (cell.blink && !self.blink_visible),
                 };
                 if style.is_some_and(|previous| previous != cell_style) {
                     self.shape_run(row, &text, &mapping, style.expect("run style"))?;
@@ -136,7 +155,7 @@ impl TextLayout {
                 }
                 style = Some(cell_style);
                 let begin = text.len();
-                if cell.text.is_empty() {
+                if cell.text.is_empty() || cell_style.hidden {
                     text.push(' ');
                 } else {
                     text.push_str(&cell.text);

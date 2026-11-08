@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -53,10 +54,13 @@ struct WispApp {
     clipboard: Option<Clipboard>,
     ime_composing: bool,
     wheel_fraction: f64,
+    horizontal_wheel_fraction: f64,
     command: Option<CommandBuilder>,
     proxy: EventLoopProxy<UserEvent>,
     pointer: CursorIcon,
     pointer_inside: bool,
+    consumed_keys: HashSet<KeyCode>,
+    default_font_size: f32,
 }
 
 impl WispApp {
@@ -65,6 +69,7 @@ impl WispApp {
         command: Option<CommandBuilder>,
         proxy: EventLoopProxy<UserEvent>,
     ) -> Self {
+        let default_font_size = config.font.size;
         Self {
             config,
             window: None,
@@ -72,13 +77,18 @@ impl WispApp {
             session: None,
             modifiers: ModifiersState::default(),
             cursor_position: (0.0, 0.0),
-            clipboard: Clipboard::new().ok(),
+            clipboard: Clipboard::new()
+                .map_err(|error| eprintln!("failed to initialize clipboard: {error}"))
+                .ok(),
             ime_composing: false,
             wheel_fraction: 0.0,
+            horizontal_wheel_fraction: 0.0,
             command,
             proxy,
             pointer: CursorIcon::Text,
             pointer_inside: false,
+            consumed_keys: HashSet::new(),
+            default_font_size,
         }
     }
 
@@ -98,6 +108,22 @@ impl WispApp {
     fn send(&self, command: Command) {
         if let Some(session) = self.session.as_ref() {
             session.send(command);
+        }
+    }
+
+    fn set_font_size(&mut self, points: f32) {
+        if let Some(renderer) = &mut self.renderer {
+            if let Err(error) = renderer.set_font_size(points) {
+                eprintln!("failed to change font size: {error}");
+                return;
+            }
+            self.config.font.size = points.clamp(2.0, 96.0);
+            if let Some(session) = &self.session {
+                session.send(Command::Geometry(renderer.geometry()));
+            }
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
         }
     }
 
@@ -155,20 +181,40 @@ impl WispApp {
                     });
                 }
             }
+            let (position, size) = renderer.ime_cursor_area();
+            if let Some(window) = &self.window {
+                window.set_ime_cursor_area(position, size);
+            }
         }
         while let Some(event) = session.try_event() {
             match event {
+                terminal::SessionEvent::Bell => {
+                    if let Some(window) = &self.window {
+                        window.request_user_attention(Some(
+                            winit::window::UserAttentionType::Informational,
+                        ));
+                    }
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.bell();
+                    }
+                }
                 terminal::SessionEvent::Clipboard(text) => {
+                    wisp::diagnostics::trace("clipboard-write");
                     if let Some(clipboard) = self.clipboard.as_mut() {
-                        let _ = clipboard.set_text(text);
+                        if let Err(error) = clipboard.set_text(text) {
+                            eprintln!("failed to copy to clipboard: {error}");
+                        }
                     }
                 }
                 terminal::SessionEvent::PrimarySelection(text) => {
                     if let Some(clipboard) = self.clipboard.as_mut() {
-                        let _ = clipboard
+                        if let Err(error) = clipboard
                             .set()
                             .clipboard(LinuxClipboardKind::Primary)
-                            .text(text);
+                            .text(text)
+                        {
+                            eprintln!("failed to copy primary selection: {error}");
+                        }
                     }
                 }
                 terminal::SessionEvent::PastePrimary => {
@@ -296,13 +342,25 @@ impl ApplicationHandler<UserEvent> for WispApp {
             }
             WindowEvent::Ime(Ime::Preedit(text, _)) => {
                 self.ime_composing = !text.is_empty();
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.set_preedit(text);
+                }
+                window.request_redraw();
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
                 self.ime_composing = false;
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.set_preedit(String::new());
+                }
                 self.send(Command::Input(text.into_bytes()));
+                window.request_redraw();
             }
             WindowEvent::Ime(Ime::Disabled) => {
                 self.ime_composing = false;
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.set_preedit(String::new());
+                }
+                window.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 wisp::diagnostics::trace("keyboard-event");
@@ -317,21 +375,69 @@ impl ApplicationHandler<UserEvent> for WispApp {
                     ElementState::Pressed => libghostty_vt::key::Action::Press,
                     ElementState::Released => libghostty_vt::key::Action::Release,
                 };
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    if event.state == ElementState::Released && self.consumed_keys.remove(&code) {
+                        return;
+                    }
+                }
+                if event.state == ElementState::Pressed
+                    && self.modifiers.shift_key()
+                    && !self.modifiers.control_key()
+                    && !self.modifiers.alt_key()
+                    && !self.modifiers.super_key()
+                {
+                    let page = self.renderer.as_ref().map_or(1, |renderer| {
+                        renderer.terminal_size().1.saturating_sub(1).max(1) as isize
+                    });
+                    let delta = match event.physical_key {
+                        PhysicalKey::Code(KeyCode::PageUp) => Some((-page, KeyCode::PageUp)),
+                        PhysicalKey::Code(KeyCode::PageDown) => Some((page, KeyCode::PageDown)),
+                        _ => None,
+                    };
+                    if let Some((delta, code)) = delta {
+                        self.consumed_keys.insert(code);
+                        self.send(Command::Scroll(delta));
+                        return;
+                    }
+                }
                 if event.state == ElementState::Pressed
                     && self.modifiers.control_key()
                     && self.modifiers.shift_key()
+                    && !self.modifiers.alt_key()
+                    && !self.modifiers.super_key()
                 {
-                    match event.physical_key {
-                        PhysicalKey::Code(KeyCode::KeyC) => {
+                    let shortcut =
+                        terminal_shortcut(event.key_without_modifiers(), event.physical_key);
+                    if shortcut.is_some()
+                        && let PhysicalKey::Code(code) = event.physical_key
+                    {
+                        self.consumed_keys.insert(code);
+                    }
+                    match shortcut {
+                        Some(KeyCode::KeyC) => {
+                            wisp::diagnostics::trace("clipboard-copy-key");
                             self.send(Command::CopySelection);
                             return;
                         }
-                        PhysicalKey::Code(KeyCode::KeyV) => {
+                        Some(KeyCode::KeyV) => {
+                            wisp::diagnostics::trace("clipboard-paste-key");
                             if let Some(clipboard) = self.clipboard.as_mut() {
                                 if let Ok(text) = clipboard.get_text() {
                                     self.send(Command::Paste(text));
                                 }
                             }
+                            return;
+                        }
+                        Some(KeyCode::Equal) => {
+                            self.set_font_size(self.config.font.size + 1.0);
+                            return;
+                        }
+                        Some(KeyCode::Minus) => {
+                            self.set_font_size(self.config.font.size - 1.0);
+                            return;
+                        }
+                        Some(KeyCode::Digit0) => {
+                            self.set_font_size(self.default_font_size);
                             return;
                         }
                         _ => {}
@@ -354,7 +460,10 @@ impl ApplicationHandler<UserEvent> for WispApp {
                     _ => event.text.as_ref().map(ToString::to_string),
                 };
                 let key = match event.physical_key {
-                    PhysicalKey::Code(code) => map_key_code(code),
+                    PhysicalKey::Code(code) => {
+                        wisp::input::map_numpad_key(code, &event.logical_key)
+                            .or_else(|| map_key_code(code))
+                    }
                     _ => None,
                 }
                 .unwrap_or(libghostty_vt::key::Key::Unidentified);
@@ -407,26 +516,41 @@ impl ApplicationHandler<UserEvent> for WispApp {
                 });
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => f64::from(y),
+                let (horizontal, lines) = match delta {
+                    MouseScrollDelta::LineDelta(horizontal, vertical) => {
+                        (f64::from(horizontal), f64::from(vertical))
+                    }
                     MouseScrollDelta::PixelDelta(position) => {
-                        let cell_height = self
+                        let (cell_width, cell_height) = self
                             .renderer
                             .as_ref()
                             .map(renderer::Renderer::cell_geometry)
-                            .map_or(1, |(_, height)| height.max(1));
-                        position.y / f64::from(cell_height)
+                            .unwrap_or((1, 1));
+                        (
+                            position.x / f64::from(cell_width.max(1)),
+                            position.y / f64::from(cell_height.max(1)),
+                        )
                     }
                 };
                 self.wheel_fraction += lines;
+                self.horizontal_wheel_fraction += horizontal;
                 let steps = self.wheel_fraction.trunc() as isize;
+                let horizontal_steps = self.horizontal_wheel_fraction.trunc() as isize;
                 self.wheel_fraction -= steps as f64;
-                if steps != 0 {
-                    let button = if steps > 0 {
-                        libghostty_vt::mouse::Button::Four
-                    } else {
-                        libghostty_vt::mouse::Button::Five
-                    };
+                self.horizontal_wheel_fraction -= horizontal_steps as f64;
+                for (steps, positive, negative) in [
+                    (
+                        steps,
+                        libghostty_vt::mouse::Button::Four,
+                        libghostty_vt::mouse::Button::Five,
+                    ),
+                    (
+                        horizontal_steps,
+                        libghostty_vt::mouse::Button::Six,
+                        libghostty_vt::mouse::Button::Seven,
+                    ),
+                ] {
+                    let button = if steps > 0 { positive } else { negative };
                     for _ in 0..steps.unsigned_abs() {
                         self.send(Command::Mouse {
                             action: libghostty_vt::mouse::Action::Press,
@@ -438,8 +562,21 @@ impl ApplicationHandler<UserEvent> for WispApp {
                     }
                 }
             }
-            WindowEvent::Focused(focused) if self.config.protocols.focus_events => {
-                self.send(Command::Focus(focused));
+            WindowEvent::Focused(focused) => {
+                if !focused {
+                    self.consumed_keys.clear();
+                    self.ime_composing = false;
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.set_preedit(String::new());
+                    }
+                }
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.set_focused(focused);
+                }
+                if self.config.protocols.focus_events {
+                    self.send(Command::Focus(focused));
+                }
+                window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
                 self.redraw(event_loop);
@@ -483,6 +620,68 @@ fn map_modifiers(modifiers: ModifiersState) -> libghostty_vt::key::Mods {
     result
 }
 
+fn terminal_shortcut(logical: Key, physical: PhysicalKey) -> Option<KeyCode> {
+    if let Key::Character(text) = logical {
+        if text.is_ascii() {
+            return match text.to_ascii_lowercase().as_str() {
+                "c" => Some(KeyCode::KeyC),
+                "v" => Some(KeyCode::KeyV),
+                "=" | "+" => Some(KeyCode::Equal),
+                "-" => Some(KeyCode::Minus),
+                "0" => Some(KeyCode::Digit0),
+                _ => None,
+            };
+        }
+    }
+    match physical {
+        PhysicalKey::Code(
+            code @ (KeyCode::KeyC
+            | KeyCode::KeyV
+            | KeyCode::Equal
+            | KeyCode::Minus
+            | KeyCode::Digit0),
+        ) => Some(code),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_shortcuts_follow_the_active_latin_layout() {
+        assert_eq!(
+            terminal_shortcut(Key::Character("c".into()), PhysicalKey::Code(KeyCode::KeyJ)),
+            Some(KeyCode::KeyC)
+        );
+        assert_eq!(
+            terminal_shortcut(Key::Character("v".into()), PhysicalKey::Code(KeyCode::KeyK)),
+            Some(KeyCode::KeyV)
+        );
+        assert_eq!(
+            terminal_shortcut(Key::Character("j".into()), PhysicalKey::Code(KeyCode::KeyC)),
+            None
+        );
+    }
+
+    #[test]
+    fn non_latin_shortcuts_retain_the_physical_copy_and_paste_bindings() {
+        assert_eq!(
+            terminal_shortcut(Key::Character("с".into()), PhysicalKey::Code(KeyCode::KeyC)),
+            Some(KeyCode::KeyC)
+        );
+        assert_eq!(
+            terminal_shortcut(Key::Character("м".into()), PhysicalKey::Code(KeyCode::KeyV)),
+            Some(KeyCode::KeyV)
+        );
+        assert_eq!(
+            terminal_shortcut(Key::Character("ц".into()), PhysicalKey::Code(KeyCode::KeyW)),
+            None
+        );
+    }
+}
+
 #[derive(Debug, Default)]
 struct StartupOptions {
     config: Option<PathBuf>,
@@ -520,8 +719,8 @@ fn map_mouse_button(button: MouseButton) -> Option<libghostty_vt::mouse::Button>
         MouseButton::Left => Some(libghostty_vt::mouse::Button::Left),
         MouseButton::Right => Some(libghostty_vt::mouse::Button::Right),
         MouseButton::Middle => Some(libghostty_vt::mouse::Button::Middle),
-        MouseButton::Back => Some(libghostty_vt::mouse::Button::Four),
-        MouseButton::Forward => Some(libghostty_vt::mouse::Button::Five),
+        MouseButton::Back => Some(libghostty_vt::mouse::Button::Eight),
+        MouseButton::Forward => Some(libghostty_vt::mouse::Button::Nine),
         MouseButton::Other(_) => None,
     }
 }
