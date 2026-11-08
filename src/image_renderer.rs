@@ -14,8 +14,13 @@ struct ImageVertex {
 type Quad = [[f32; 2]; 4];
 type ClippedQuad = (Quad, Quad);
 
+const TEXTURE_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+const TEXTURE_CACHE_ENTRIES: usize = 1024;
+
 struct TextureEntry {
     bind_group: wgpu::BindGroup,
+    bytes: u64,
+    last_used: u64,
 }
 
 struct ImageDraw {
@@ -29,6 +34,9 @@ pub struct ImageRenderer {
     texture_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     textures: HashMap<u64, TextureEntry>,
+    texture_bytes: u64,
+    texture_budget: u64,
+    texture_clock: u64,
     vertices: Vec<ImageVertex>,
     buffer: wgpu::Buffer,
     buffer_size: u64,
@@ -128,6 +136,9 @@ impl ImageRenderer {
             texture_layout,
             sampler,
             textures: HashMap::new(),
+            texture_bytes: 0,
+            texture_budget: TEXTURE_CACHE_BYTES,
+            texture_clock: 0,
             vertices: Vec::new(),
             buffer,
             buffer_size,
@@ -147,15 +158,35 @@ impl ImageRenderer {
     ) -> Result<(), String> {
         self.vertices.clear();
         self.draws.clear();
+        self.texture_clock = self.texture_clock.wrapping_add(1);
         let mut retained = HashSet::new();
         let limit = device.limits().max_texture_dimension_2d;
         for placement in snapshot.placements.iter() {
             let image = &placement.image;
-            retained.insert(image.generation);
             if image.width == 0 || image.height == 0 || image.width > limit || image.height > limit
             {
                 continue;
             }
+            let destination = [
+                clip[0]
+                    + placement.grid_position[0] as f32 * cell_size[0] as f32
+                    + placement.offset[0] as f32,
+                clip[1]
+                    + placement.grid_position[1] as f32 * cell_size[1] as f32
+                    + placement.offset[1] as f32,
+                placement.pixel_size[0] as f32,
+                placement.pixel_size[1] as f32,
+            ];
+            let Some((position, uv)) = clipped_quad(
+                destination,
+                placement.source,
+                [image.width, image.height],
+                clip,
+                surface_size,
+            ) else {
+                continue;
+            };
+            retained.insert(image.generation);
             if !self.textures.contains_key(&image.generation) {
                 let expected = u64::from(image.width) * u64::from(image.height) * 4;
                 if image.rgba.len() as u64 != expected {
@@ -205,29 +236,18 @@ impl ImageRenderer {
                         },
                     ],
                 });
-                self.textures
-                    .insert(image.generation, TextureEntry { bind_group });
+                self.textures.insert(
+                    image.generation,
+                    TextureEntry {
+                        bind_group,
+                        bytes: expected,
+                        last_used: self.texture_clock,
+                    },
+                );
+                self.texture_bytes += expected;
                 self.uploads += 1;
             }
-            let destination = [
-                clip[0]
-                    + placement.grid_position[0] as f32 * cell_size[0] as f32
-                    + placement.offset[0] as f32,
-                clip[1]
-                    + placement.grid_position[1] as f32 * cell_size[1] as f32
-                    + placement.offset[1] as f32,
-                placement.pixel_size[0] as f32,
-                placement.pixel_size[1] as f32,
-            ];
-            let Some((position, uv)) = clipped_quad(
-                destination,
-                placement.source,
-                [image.width, image.height],
-                clip,
-                surface_size,
-            ) else {
-                continue;
-            };
+            self.textures.get_mut(&image.generation).unwrap().last_used = self.texture_clock;
             let first = self.vertices.len() as u32;
             for index in [0, 1, 2, 0, 2, 3] {
                 self.vertices.push(ImageVertex {
@@ -241,8 +261,7 @@ impl ImageRenderer {
                 vertices: first..self.vertices.len() as u32,
             });
         }
-        self.textures
-            .retain(|generation, _| retained.contains(generation));
+        self.trim_textures(&retained);
         let bytes = bytemuck::cast_slice(&self.vertices);
         if bytes.len() as u64 > self.buffer_size {
             self.buffer_size = (bytes.len() as u64).next_power_of_two();
@@ -270,6 +289,29 @@ impl ImageRenderer {
 
     pub fn texture_uploads(&self) -> u64 {
         self.uploads
+    }
+
+    fn trim_textures(&mut self, retained: &HashSet<u64>) {
+        if self.texture_bytes <= self.texture_budget && self.textures.len() <= TEXTURE_CACHE_ENTRIES
+        {
+            return;
+        }
+        let mut candidates = self
+            .textures
+            .iter()
+            .filter(|(generation, _)| !retained.contains(generation))
+            .map(|(generation, entry)| (entry.last_used, *generation))
+            .collect::<Vec<_>>();
+        candidates.sort_unstable();
+        for (_, generation) in candidates {
+            if self.texture_bytes <= self.texture_budget
+                && self.textures.len() <= TEXTURE_CACHE_ENTRIES
+            {
+                break;
+            }
+            let entry = self.textures.remove(&generation).unwrap();
+            self.texture_bytes -= entry.bytes;
+        }
     }
 }
 
@@ -522,6 +564,125 @@ mod tests {
                 &[25, 51, 102, 255]
             );
         }
+    }
+
+    #[test]
+    fn image_gpu_reuses_uploaded_animation_frames_across_loops() {
+        let (device, queue) = device();
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = ImageRenderer::new(&device, format);
+        let first = snapshot(501, [255, 0, 0, 255], 0);
+        let second = snapshot(502, [0, 255, 0, 255], 0);
+        for frame in [&first, &second, &first, &second, &first] {
+            renderer
+                .prepare(
+                    &device,
+                    &queue,
+                    frame,
+                    [16, 16],
+                    [8, 8],
+                    [3.0, 3.0, 8.0, 8.0],
+                )
+                .unwrap();
+            let pixels = capture(&device, &queue, &renderer, format);
+            assert_eq!(
+                pixel(&pixels, 4, 4),
+                frame.placements[0].image.rgba.as_ref()
+            );
+        }
+        assert_eq!(renderer.texture_uploads(), 2);
+        assert_eq!(renderer.texture_bytes, 8);
+    }
+
+    #[test]
+    fn image_gpu_evicts_least_recent_hidden_frames_to_respect_budget() {
+        let (device, queue) = device();
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = ImageRenderer::new(&device, format);
+        renderer.texture_budget = 8;
+        let first = snapshot(601, [255, 0, 0, 255], 0);
+        let second = snapshot(602, [0, 255, 0, 255], 0);
+        let third = snapshot(603, [0, 0, 255, 255], 0);
+        for frame in [&first, &second, &first, &third] {
+            renderer
+                .prepare(
+                    &device,
+                    &queue,
+                    frame,
+                    [16, 16],
+                    [8, 8],
+                    [3.0, 3.0, 8.0, 8.0],
+                )
+                .unwrap();
+        }
+        assert_eq!(renderer.texture_uploads(), 3);
+        assert!(renderer.textures.contains_key(&601));
+        assert!(!renderer.textures.contains_key(&602));
+        assert!(renderer.textures.contains_key(&603));
+        assert_eq!(renderer.texture_bytes, 8);
+        renderer
+            .prepare(
+                &device,
+                &queue,
+                &second,
+                [16, 16],
+                [8, 8],
+                [3.0, 3.0, 8.0, 8.0],
+            )
+            .unwrap();
+        assert_eq!(renderer.texture_uploads(), 4);
+        assert_eq!(renderer.texture_bytes, 8);
+        assert_eq!(
+            pixel(&capture(&device, &queue, &renderer, format), 4, 4),
+            &[0, 255, 0, 255]
+        );
+        renderer.texture_budget = 0;
+        renderer
+            .prepare(
+                &device,
+                &queue,
+                &second,
+                [16, 16],
+                [8, 8],
+                [3.0, 3.0, 8.0, 8.0],
+            )
+            .unwrap();
+        assert_eq!(renderer.textures.len(), 1);
+        assert_eq!(renderer.texture_bytes, 4);
+        assert!(renderer.textures.contains_key(&602));
+        renderer
+            .prepare(
+                &device,
+                &queue,
+                &GraphicsSnapshot::default(),
+                [16, 16],
+                [8, 8],
+                [3.0, 3.0, 8.0, 8.0],
+            )
+            .unwrap();
+        assert_eq!(renderer.texture_bytes, 0);
+        assert!(renderer.textures.is_empty());
+    }
+
+    #[test]
+    fn image_gpu_skips_uploads_for_completely_clipped_placements() {
+        let (device, queue) = device();
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = ImageRenderer::new(&device, format);
+        let image = snapshot(701, [255, 0, 0, 255], 0);
+        renderer
+            .prepare(
+                &device,
+                &queue,
+                &image,
+                [16, 16],
+                [8, 16],
+                [0.0, 0.0, 8.0, 8.0],
+            )
+            .unwrap();
+        assert_eq!(renderer.texture_uploads(), 0);
+        assert!(renderer.draws.is_empty());
+        assert_eq!(renderer.texture_bytes, 0);
     }
 
     #[test]

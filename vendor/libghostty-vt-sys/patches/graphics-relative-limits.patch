@@ -1,0 +1,11 @@
+diff --git a/src/terminal/kitty/graphics_storage.zig b/src/terminal/kitty/graphics_storage.zig
+--- a/src/terminal/kitty/graphics_storage.zig
++++ b/src/terminal/kitty/graphics_storage.zig
+@@ -175,6 +175,7 @@
+         s: *terminal.Screen,
+         limit: usize,
+     ) !void {
++        defer self.pruneOrphans(alloc, s);
+         // Special case disabling by quickly deleting all
+         if (limit == 0) {
+             const image_limits = self.image_limits;

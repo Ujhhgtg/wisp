@@ -1,0 +1,397 @@
+diff --git a/src/terminal/c/kitty_graphics.zig b/src/terminal/c/kitty_graphics.zig
+index 13a675ccc..2b357f782 100644
+--- a/src/terminal/c/kitty_graphics.zig
++++ b/src/terminal/c/kitty_graphics.zig
+@@ -603,6 +603,15 @@ fn computeViewportPos(
+     image: *const Image,
+     t: *Terminal,
+ ) struct { col: i32, row: i32, visible: bool } {
++    if (p.parent != null) {
++        const origin = p.viewportOrigin(t, 0) orelse return .{ .col = 0, .row = 0, .visible = false };
++        const grid_size = p.gridSize(image.*, t);
++        return .{
++            .col = origin[0],
++            .row = origin[1],
++            .visible = @as(i64, origin[1]) + grid_size.rows > 0 and origin[1] < t.rows,
++        };
++    }
+     // Virtual placements use unicode placeholders and don't have a
+     // screen position — they are rendered inline by the text layout.
+     const pin = switch (p.location) {
+@@ -1554,6 +1563,44 @@ test "placement_render_info returns all fields" {
+     try testing.expectEqual(2, ri.source_height);
+ }
+ 
++test "placement_render_info relative follows parents and virtual anchors" {
++    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
++    var t: terminal_c.Terminal = null;
++    try testing.expectEqual(Result.success, terminal_c.new(
++        &lib.alloc.test_allocator,
++        &t,
++        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
++    ));
++    defer terminal_c.free(t);
++    try testing.expectEqual(Result.success, terminal_c.resize(t, 80, 24, 8, 16));
++    const cmd = "\x1b[3;4H\x1b_Ga=T,f=32,s=1,v=1,i=101,p=1,C=1;/wAA/w==\x1b\\" ++
++        "\x1b_Ga=T,f=32,s=1,v=1,i=102,p=2,P=101,Q=1,H=2,V=-1;/wAA/w==\x1b\\";
++    terminal_c.vt_write(t, cmd.ptr, cmd.len);
++    const term = t.?.terminal;
++    const storage = &term.screens.active.kitty_images;
++    const child_key = storage.parentKey(102, 2).?;
++    const child = storage.placements.getPtr(child_key).?;
++    try testing.expectEqual([2]i32{ 5, 1 }, child.viewportOrigin(term, 0).?);
++    try testing.expectEqual(3, term.screens.active.cursor.x);
++    try testing.expectEqual(2, term.screens.active.cursor.y);
++
++    const move = "\x1b[6;8H\x1b_Ga=p,i=101,p=1,C=1\x1b\\";
++    terminal_c.vt_write(t, move.ptr, move.len);
++    try testing.expectEqual([2]i32{ 9, 4 }, storage.placements.getPtr(child_key).?.viewportOrigin(term, 0).?);
++
++    const virtual = "\x1b_Ga=T,f=32,s=1,v=1,i=103,p=3,U=1,c=2,r=2;/wAA/w==\x1b\\" ++
++        "\x1b[10;12H\x1b[38;5;103;58;5;3m\u{10eeee}\u{305}\u{305}" ++
++        "\x1b[8;15H\u{10eeee}\u{30d}\u{30d}\x1b[m" ++
++        "\x1b_Ga=p,i=102,p=2,P=103,Q=3,H=1,V=-2\x1b\\";
++    terminal_c.vt_write(t, virtual.ptr, virtual.len);
++    try testing.expectEqual([2]i32{ 12, 5 }, storage.placements.getPtr(child_key).?.viewportOrigin(term, 0).?);
++
++    const remove = "\x1b_Ga=d,d=i,i=103,p=3\x1b\\";
++    terminal_c.vt_write(t, remove.ptr, remove.len);
++    try testing.expect(storage.parentKey(102, 2) == null);
++    try testing.expect(storage.imageById(102) == null);
++}
++
+ test "placement_render_info off-screen sets viewport_visible false" {
+     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+ 
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+index 6c72ec4e9..6b4326711 100644
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -32,6 +32,7 @@ pub fn execute(
+         log.debug("kitty graphics requested but disabled", .{});
+         return null;
+     }
++    defer terminal.screens.active.kitty_images.pruneOrphans(alloc, terminal.screens.active);
+ 
+     log.debug("executing kitty graphics command: quiet={} control={}", .{
+         cmd.quiet,
+@@ -212,6 +213,38 @@ fn display(
+     // Make sure our response has the image id in case we looked up by number
+     result.id = img.id;
+ 
++    var parent: ?ImageStorage.PlacementKey = null;
++    if (d.virtual_placement and d.parent_id != 0) {
++        result.message = "EINVAL: virtual placement cannot refer to a parent";
++        return result;
++    }
++    if (d.parent_id != 0) {
++        parent = storage.parentKey(d.parent_id, d.parent_placement_id) orelse {
++            result.message = "ENOPARENT: parent placement not found";
++            return result;
++        };
++        var ancestor = parent;
++        var depth: usize = 0;
++        while (ancestor) |key| {
++            if (key.image_id == img.id and key.placement_id.tag == .external and
++                key.placement_id.id == d.placement_id and d.placement_id != 0)
++            {
++                result.message = "ECYCLE: relative placement cycle";
++                return result;
++            }
++            depth += 1;
++            if (depth > 32) {
++                result.message = "ETOODEEP: relative placement chain exceeds limit";
++                return result;
++            }
++            const placement = storage.placements.get(key) orelse {
++                result.message = "ENOPARENT: parent placement not found";
++                return result;
++            };
++            ancestor = placement.parent;
++        }
++    }
++
+     // Location where the placement will go.
+     const location: ImageStorage.Placement.Location = location: {
+         // Virtual placements are not tracked
+@@ -239,6 +272,9 @@ fn display(
+     // Add the placement
+     const p: ImageStorage.Placement = .{
+         .location = location,
++        .parent = parent,
++        .horizontal_offset = d.horizontal_offset,
++        .vertical_offset = d.vertical_offset,
+         .x_offset = d.x_offset,
+         .y_offset = d.y_offset,
+         .source_x = d.x,
+@@ -249,6 +285,13 @@ fn display(
+         .rows = d.rows,
+         .z = d.z,
+     };
++    const previous = if (result.placement_id != 0)
++        storage.placements.get(.{
++            .image_id = img.id,
++            .placement_id = .{ .tag = .external, .id = result.placement_id },
++        })
++    else
++        null;
+     storage.addPlacement(
+         alloc,
+         img.id,
+@@ -259,26 +302,29 @@ fn display(
+         encodeError(&result, err);
+         return result;
+     };
++    if (previous) |old| old.deinit(terminal.screens.active);
+ 
+     // Apply cursor movement setting. This only applies to pin placements.
+-    switch (p.location) {
+-        .virtual => {},
+-        .pin => |pin| switch (d.cursor_movement) {
+-            .none => {},
+-            .after => {
+-                // We use terminal.index to properly handle scroll regions.
+-                const size = p.gridSize(img, terminal);
+-                for (0..size.rows) |_| terminal.index() catch |err| {
+-                    log.warn("failed to move cursor: {}", .{err});
+-                    break;
+-                };
+-
+-                terminal.setCursorPos(
+-                    terminal.screens.active.cursor.y,
+-                    pin.x + size.cols + 1,
+-                );
++    if (parent == null) {
++        switch (p.location) {
++            .virtual => {},
++            .pin => |pin| switch (d.cursor_movement) {
++                .none => {},
++                .after => {
++                    // We use terminal.index to properly handle scroll regions.
++                    const size = p.gridSize(img, terminal);
++                    for (0..size.rows) |_| terminal.index() catch |err| {
++                        log.warn("failed to move cursor: {}", .{err});
++                        break;
++                    };
++
++                    terminal.setCursorPos(
++                        terminal.screens.active.cursor.y,
++                        pin.x + size.cols + 1,
++                    );
++                },
+             },
+-        },
++        }
+     }
+ 
+     return result;
+@@ -423,6 +469,41 @@ test "kittygfx more chunks with q=1" {
+     }
+ }
+ 
++test "kittygfx relative validation and minimum depth" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++    t.width_px = 40;
++    t.height_px = 80;
++    const transmitted = try command.Parser.parseString(alloc, "a=T,f=32,s=1,v=1,i=1,p=1,C=1;/wAA/w==");
++    defer transmitted.deinit(alloc);
++    try testing.expect(execute(alloc, &t, &transmitted).?.ok());
++    const invalid = .{
++        .{ "a=p,i=1,p=2,P=9,Q=1", "ENOPARENT:" },
++        .{ "a=p,i=1,p=2,U=1,P=9,Q=1", "EINVAL:" },
++        .{ "a=p,i=1,p=1,P=1,Q=1", "ECYCLE:" },
++    };
++    inline for (invalid) |item| {
++        const cmd = try command.Parser.parseString(alloc, item[0]);
++        defer cmd.deinit(alloc);
++        try testing.expect(std.mem.startsWith(u8, execute(alloc, &t, &cmd).?.message, item[1]));
++    }
++    for (2..34) |placement_id| {
++        const text = try std.fmt.allocPrint(alloc, "a=p,i=1,p={d},P=1,Q={d},H=1,V=-1", .{ placement_id, placement_id - 1 });
++        defer alloc.free(text);
++        const cmd = try command.Parser.parseString(alloc, text);
++        defer cmd.deinit(alloc);
++        try testing.expect(execute(alloc, &t, &cmd).?.ok());
++    }
++    const overflow = try command.Parser.parseString(alloc, "a=p,i=1,p=34,P=1,Q=33");
++    defer overflow.deinit(alloc);
++    try testing.expect(std.mem.startsWith(u8, execute(alloc, &t, &overflow).?.message, "ETOODEEP:"));
++    const cycle = try command.Parser.parseString(alloc, "a=p,i=1,p=1,P=1,Q=9");
++    defer cycle.deinit(alloc);
++    try testing.expect(std.mem.startsWith(u8, execute(alloc, &t, &cycle).?.message, "ECYCLE:"));
++}
++
+ test "kittygfx more chunks with q=0" {
+     const testing = std.testing;
+     const alloc = testing.allocator;
+diff --git a/src/terminal/kitty/graphics_storage.zig b/src/terminal/kitty/graphics_storage.zig
+index ba82ea402..4d4b4d4c8 100644
+--- a/src/terminal/kitty/graphics_storage.zig
++++ b/src/terminal/kitty/graphics_storage.zig
+@@ -118,6 +118,7 @@ pub const ImageStorage = struct {
+ 
+     /// The set of placements for loaded images.
+     placements: PlacementMap = .{},
++    has_relative_placements: bool = false,
+ 
+     /// Non-null if there is an in-progress loading image.
+     loading: ?*LoadingImage = null,
+@@ -274,10 +275,45 @@ pub const ImageStorage = struct {
+ 
+         const gop = try self.placements.getOrPut(alloc, key);
+         gop.value_ptr.* = p;
++        self.has_relative_placements = self.has_relative_placements or p.parent != null;
+ 
+         self.markMutated();
+     }
+ 
++    pub fn parentKey(self: *const ImageStorage, image_id: u32, placement_id: u32) ?PlacementKey {
++        if (placement_id != 0) {
++            const key: PlacementKey = .{
++                .image_id = image_id,
++                .placement_id = .{ .tag = .external, .id = placement_id },
++            };
++            return if (self.placements.contains(key)) key else null;
++        }
++        var it = self.placements.keyIterator();
++        while (it.next()) |key| {
++            if (key.image_id == image_id) return key.*;
++        }
++        return null;
++    }
++
++    pub fn pruneOrphans(self: *ImageStorage, alloc: Allocator, s: *terminal.Screen) void {
++        if (!self.has_relative_placements) return;
++        var changed = true;
++        while (changed) {
++            changed = false;
++            var it = self.placements.iterator();
++            while (it.next()) |entry| {
++                const parent = entry.value_ptr.parent orelse continue;
++                if (self.placements.contains(parent) and self.images.contains(parent.image_id)) continue;
++                const image_id = entry.key_ptr.image_id;
++                entry.value_ptr.deinit(s);
++                self.placements.removeByPtr(entry.key_ptr);
++                self.deleteIfUnused(alloc, image_id);
++                changed = true;
++                self.markMutated();
++            }
++        }
++    }
++
+     fn clearPlacements(self: *ImageStorage, s: *terminal.Screen) void {
+         var it = self.placements.iterator();
+         while (it.next()) |entry| entry.value_ptr.deinit(s);
+@@ -322,6 +358,7 @@ pub const ImageStorage = struct {
+         // the generation.
+         const placements_before = self.placements.count();
+         const images_before = self.images.count();
++        defer self.pruneOrphans(alloc, t.screens.active);
+         defer if (self.placements.count() != placements_before or
+             self.images.count() != images_before) self.markMutated();
+ 
+@@ -716,6 +753,9 @@ pub const ImageStorage = struct {
+     pub const Placement = struct {
+         /// The location where this placement should be drawn.
+         location: Location,
++        parent: ?PlacementKey = null,
++        horizontal_offset: i32 = 0,
++        vertical_offset: i32 = 0,
+ 
+         /// Offset of the x/y from the top-left of the cell.
+         x_offset: u32 = 0,
+@@ -752,6 +792,63 @@ pub const ImageStorage = struct {
+             }
+         }
+ 
++        pub fn viewportOrigin(self: *const Placement, t: *const terminal.Terminal, depth: u8) ?[2]i32 {
++            if (depth > 32) return null;
++            const pages = &t.screens.active.pages;
++            const storage = &t.screens.active.kitty_images;
++            if (self.parent) |key| {
++                const parent = storage.placements.getPtr(key) orelse return null;
++                const origin = parent.viewportOrigin(t, depth + 1) orelse return null;
++                return .{
++                    std.math.cast(i32, @as(i64, origin[0]) + self.horizontal_offset) orelse return null,
++                    std.math.cast(i32, @as(i64, origin[1]) + self.vertical_offset) orelse return null,
++                };
++            }
++            const viewport = pages.pointFromPin(.screen, pages.getTopLeft(.viewport)) orelse return null;
++            switch (self.location) {
++                .pin => |pin| {
++                    const position = pages.pointFromPin(.screen, pin.*) orelse return null;
++                    return .{
++                        @intCast(position.screen.x),
++                        @as(i32, @intCast(position.screen.y)) - @as(i32, @intCast(viewport.screen.y)),
++                    };
++                },
++                .virtual => {
++                    var key_: ?PlacementKey = null;
++                    var entries = storage.placements.iterator();
++                    while (entries.next()) |entry| {
++                        if (entry.value_ptr == self) {
++                            key_ = entry.key_ptr.*;
++                            break;
++                        }
++                    }
++                    const key = key_ orelse return null;
++                    var placements = @import("graphics_unicode.zig").placementIterator(
++                        pages.getTopLeft(.viewport),
++                        pages.getBottomRight(.viewport),
++                    );
++                    var origin: ?[2]i32 = null;
++                    while (placements.next()) |placement| {
++                        if (placement.image_id != key.image_id) continue;
++                        if (placement.placement_id != 0 and
++                            (key.placement_id.tag != .external or placement.placement_id != key.placement_id.id)) continue;
++                        const position = pages.pointFromPin(.screen, placement.pin) orelse continue;
++                        const current: [2]i32 = .{
++                            @intCast(position.screen.x),
++                            @as(i32, @intCast(position.screen.y)) - @as(i32, @intCast(viewport.screen.y)),
++                        };
++                        if (origin) |*previous| {
++                            previous[0] = @min(previous[0], current[0]);
++                            previous[1] = @min(previous[1], current[1]);
++                        } else {
++                            origin = current;
++                        }
++                    }
++                    return origin;
++                },
++            }
++        }
++
+         /// Returns the size of this placement's image in pixels,
+         /// taking into account the source rectangle, specified
+         /// rows/columns, and aspect ratio.
+@@ -876,6 +973,27 @@ pub const ImageStorage = struct {
+             t: *const terminal.Terminal,
+         ) ?Rect {
+             const grid_size = self.gridSize(image, t);
++            if (self.parent != null) {
++                const origin = self.viewportOrigin(t, 0) orelse return null;
++                const viewport = t.screens.active.pages.pointFromPin(
++                    .screen,
++                    t.screens.active.pages.getTopLeft(.viewport),
++                ) orelse return null;
++                const top = @as(i64, viewport.screen.y) + origin[1];
++                const bottom = top + grid_size.rows - 1;
++                const left: i64 = origin[0];
++                const right = left + grid_size.cols - 1;
++                if (bottom < 0 or right < 0 or left >= t.cols) return null;
++                const top_left = t.screens.active.pages.pin(.{ .screen = .{
++                    .x = @intCast(@max(left, 0)),
++                    .y = std.math.cast(u32, @max(top, 0)) orelse return null,
++                } }) orelse return null;
++                const bottom_right = t.screens.active.pages.pin(.{ .screen = .{
++                    .x = @intCast(@min(right, t.cols - 1)),
++                    .y = std.math.cast(u32, bottom) orelse return null,
++                } }) orelse return null;
++                return .{ .top_left = top_left, .bottom_right = bottom_right };
++            }
+             const pin = switch (self.location) {
+                 .pin => |p| p,
+                 .virtual => return null,

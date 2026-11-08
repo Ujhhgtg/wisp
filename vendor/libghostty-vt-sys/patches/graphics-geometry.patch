@@ -1,0 +1,26 @@
+diff --git a/src/terminal/kitty/graphics_storage.zig b/src/terminal/kitty/graphics_storage.zig
+--- a/src/terminal/kitty/graphics_storage.zig
++++ b/src/terminal/kitty/graphics_storage.zig
+@@ -763,3 +763,10 @@
+-            const width = if (self.source_width > 0) self.source_width else image.width;
+-            const height = if (self.source_height > 0) self.source_height else image.height;
++            const width = @min(
++                if (self.source_width > 0) self.source_width else image.width,
++                image.width - @min(self.source_x, image.width),
++            );
++            const height = @min(
++                if (self.source_height > 0) self.source_height else image.height,
++                image.height - @min(self.source_y, image.height),
++            );
++            if (width == 0 or height == 0) return .{ .width = 0, .height = 0 };
+ 
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -243,4 +243,4 @@
+-        .x_offset = d.x_offset,
+-        .y_offset = d.y_offset,
++        .x_offset = @min(d.x_offset, (terminal.width_px / terminal.cols) -| 1),
++        .y_offset = @min(d.y_offset, (terminal.height_px / terminal.rows) -| 1),
+         .source_x = d.x,
+         .source_y = d.y,

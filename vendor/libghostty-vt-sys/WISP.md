@@ -21,6 +21,23 @@ build script. Wisp changes only:
   the existing `printSlice` path. It follows upstream commit
   `5b70f208bc6870bb32f13720376840edc3c5ed31`, restricted to ASCII and a 128-codepoint
   buffer (512 bytes of stack). Other characters retain the original loop.
+- `graphics-conformance.patch` corrects range deletion, upload cancellation,
+  automatic ID collisions, and adds the borrowed image-number lookup used by
+  Wisp's safe binding extension.
+- `graphics-relative.patch` adds parent validation, 32-level chains, cycle
+  detection, parent-following geometry, virtual parents, and cascading deletion.
+  `graphics-relative-limits.patch` and `graphics-relative-anchors.patch` extend
+  cleanup after eviction and exclude invisible placeholder fragments from anchors.
+- `graphics-replace.patch` validates query data, clears old placements on a
+  successful replacement, implements exact local-file offset/length reads, and
+  reports uniform file errors with regular-file checks before opening.
+- `graphics-geometry.patch` uses clipped source extents for size calculations
+  and clamps placement offsets to a cell.
+
+The build records the complete patch set in its private Cargo output directory.
+When the patch set changes, only its managed source files are restored to the
+pinned commit before applying all patches in order. Repeated builds do not
+attempt to apply overlapping incremental patches twice.
 
 For the standard 512-entry grapheme table, raw table slots increase from 512
 to 1024: 10,768 to 21,520 bytes on x86_64. Cell storage and grapheme text
@@ -29,8 +46,9 @@ scrollback can consume additional memory.
 
 An explicit `GHOSTTY_SOURCE_DIR` remains authoritative and is never modified
 by this build script. To benchmark a custom checkout with the same fix,
-apply both patches to that checkout yourself. A pkg-config library also remains
-external and is not patched.
+apply the complete ordered patch set to that checkout yourself. It must include
+the image-number C helper required by the matching safe bindings. A pkg-config
+library likewise needs those matching extensions and is not patched in place.
 
 Validation: Ghostty's `Page` native test filter passes 821 tests with both
 patch changes. Wisp additionally exercises dense combining characters with
@@ -42,3 +60,9 @@ counts up to 8193, including cell contents, styles, protection, wrapping,
 cursor state, and page integrity. The entire Terminal suite is not claimed:
 an existing `fullReset tracked pins` test cannot compile in ReleaseFast because
 it requires runtime-safety checks.
+
+Additional native graphics filters pass 508 tests with six expected skips;
+relative placement/storage filters pass 131 tests and the anchor filter passes
+57 tests. Wisp additionally exercises graphics through its real PTY, snapshot,
+GPU, and actual-window paths. Animation state and rendering live in Wisp rather
+than adding incompatible fields to the native image C ABI.

@@ -1,0 +1,132 @@
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -169,6 +169,12 @@ fn query(
+         encodeError(&result, err);
+         return result;
+     };
++    var checked = loading.complete(alloc) catch |err| {
++        loading.deinit(alloc);
++        encodeError(&result, err);
++        return result;
++    };
++    checked.deinit(alloc);
+     loading.deinit(alloc);
+ 
+     return result;
+@@ -413,7 +419,15 @@ fn loadAndAddImage(
+     // Validate and store our image
+     var img = try loading.complete(alloc);
+     errdefer img.deinit(alloc);
++    const replaced = storage.images.contains(img.id);
+     try storage.addImage(alloc, img);
++    if (replaced) {
++        storage.delete(alloc, terminal, .{ .id = .{
++            .image_id = img.id,
++            .placement_id = 0,
++            .delete = false,
++        } });
++    }
+ 
+     // Get our display settings
+     const display_ = loading.display;
+@@ -432,6 +446,7 @@ fn encodeError(r: *Response, err: EncodeableError) void {
+     switch (err) {
+         error.OutOfMemory => r.message = "ENOMEM: out of memory",
+         error.InvalidData => r.message = "EINVAL: invalid data",
++        error.FileReadFailed => r.message = "EBADF:Failed to read image file",
+         error.DecompressionFailed => r.message = "EINVAL: decompression failed",
+         error.FilePathTooLong => r.message = "EINVAL: file path too long",
+         error.TemporaryFileNotInTempDir => r.message = "EINVAL: temporary file not in temp dir",
+diff --git a/src/terminal/kitty/graphics_image.zig b/src/terminal/kitty/graphics_image.zig
+--- a/src/terminal/kitty/graphics_image.zig
++++ b/src/terminal/kitty/graphics_image.zig
+@@ -136,7 +136,7 @@ pub const LoadingImage = struct {
+             .direct => unreachable, // handled above
+             .file, .temporary_file => posix.realpath(cmd.data, &abs_buf) catch |err| {
+                 log.warn("failed to get absolute path: {}", .{err});
+-                return error.InvalidData;
++                return error.FileReadFailed;
+             },
+             .shared_memory => cmd.data,
+         };
+@@ -267,7 +267,7 @@ pub const LoadingImage = struct {
+             (std.mem.startsWith(u8, path, "/dev/") and
+                 !std.mem.startsWith(u8, path, "/dev/shm/")))
+         {
+-            return error.InvalidData;
++            return error.FileReadFailed;
+         }
+ 
+         // Temporary file logic
+@@ -283,9 +283,12 @@ pub const LoadingImage = struct {
+             };
+         };
+ 
++        const initial_stat = std.fs.cwd().statFile(path) catch return error.FileReadFailed;
++        if (initial_stat.kind != .file) return error.FileReadFailed;
++
+         var file = std.fs.cwd().openFile(path, .{}) catch |err| {
+             log.warn("failed to open temporary file: {}", .{err});
+-            return error.InvalidData;
++            return error.FileReadFailed;
+         };
+         defer file.close();
+ 
+@@ -293,32 +296,35 @@ pub const LoadingImage = struct {
+         if (file.stat()) |stat| {
+             if (stat.kind != .file) {
+                 log.warn("file is not a regular file kind={}", .{stat.kind});
+-                return error.InvalidData;
++                return error.FileReadFailed;
+             }
+         } else |err| {
+             log.warn("failed to stat file: {}", .{err});
+-            return error.InvalidData;
++            return error.FileReadFailed;
+         }
+ 
+         if (t.offset > 0) {
+             file.seekTo(@intCast(t.offset)) catch |err| {
+                 log.warn("failed to seek to offset {}: {}", .{ t.offset, err });
+-                return error.InvalidData;
++                return error.FileReadFailed;
+             };
+         }
+ 
+-        var buf: [4096]u8 = undefined;
+-        var buf_reader = file.reader(&buf);
+-        const reader = &buf_reader.interface;
+-
+-        // Read the file
+         var managed: std.ArrayList(u8) = .empty;
+         errdefer managed.deinit(alloc);
+-        const size: usize = if (t.size > 0) @min(t.size, max_size) else max_size;
+-        reader.appendRemaining(alloc, &managed, .limited(size)) catch {
+-            log.warn("failed to read temporary file: {?}", .{buf_reader.err});
+-            return error.InvalidData;
+-        };
++        const stat = file.stat() catch return error.FileReadFailed;
++        if (t.offset > stat.size) return error.FileReadFailed;
++        const available = stat.size - t.offset;
++        const size: u64 = if (t.size > 0) t.size else available;
++        if (size > available or size > max_size) return error.FileReadFailed;
++        try managed.resize(alloc, @intCast(size));
++        const read = file.readAll(managed.items) catch return error.FileReadFailed;
++        if (read != size) return error.FileReadFailed;
++        if (self.image.format != .png and self.image.compression == .none) {
++            const bpp = command.Transmission.formatBpp(self.image.format);
++            const expected = @as(u64, self.image.width) * self.image.height * bpp;
++            if (size < expected) return error.FileReadFailed;
++        }
+ 
+         // Set our data
+         assert(self.data.items.len == 0);
+@@ -529,6 +535,7 @@ pub const Image = struct {
+ 
+     pub const Error = error{
+         InvalidData,
++        FileReadFailed,
+         DecompressionFailed,
+         DimensionsRequired,
+         DimensionsTooLarge,

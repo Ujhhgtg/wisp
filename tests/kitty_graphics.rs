@@ -78,7 +78,8 @@ fn direct_rgba_pixels_placements_and_unchanged_arcs_are_preserved() {
     assert_eq!(placement.z, -1);
     assert_eq!(ImageLayer::from_z(placement.z), ImageLayer::BelowText);
     assert_eq!(placement.grid_position, [3, 2]);
-    assert_eq!(placement.offset, [3, 4]);
+    assert_eq!(placement.offset, [3, 8]);
+    assert_eq!(placement.pixel_size, [16, 8]);
     assert_eq!(
         placement.image.rgba.as_ref(),
         &[255, 0, 0, 255, 0, 255, 0, 128]
@@ -89,6 +90,24 @@ fn direct_rgba_pixels_placements_and_unchanged_arcs_are_preserved() {
         &first.placements[0].image,
         &unchanged.placements[0].image
     ));
+}
+
+#[test]
+fn clipped_source_rectangles_control_natural_size_and_empty_crops_are_not_rendered() {
+    let (mut terminal, config, mut snapshots) = terminal();
+    terminal.vt_write(b"\x1b_Ga=T,f=32,s=2,v=1,i=17,p=1,x=1,C=1;/wAA/wD/AIA=\x1b\\");
+    let first = snapshots.update(&terminal, &config).unwrap().graphics;
+    assert_eq!(first.placements[0].pixel_size, [1, 1]);
+    assert_eq!(first.placements[0].source, [1.0, 0.0, 1.0, 1.0]);
+    terminal.vt_write(b"\x1b_Ga=p,i=17,p=1,x=2,r=1,C=1\x1b\\");
+    assert!(
+        snapshots
+            .update(&terminal, &config)
+            .unwrap()
+            .graphics
+            .placements
+            .is_empty()
+    );
 }
 
 #[test]

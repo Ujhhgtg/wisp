@@ -7,6 +7,8 @@ license = "MIT"
 [dependencies]
 arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
 bytemuck = { version = "1.23", features = ["derive"] }
+base64 = "0.22"
+flate2 = "1.1"
 glyphon = "0.12"
 libghostty-vt = { version = "0.2.2", features = ["kitty-graphics", "png"] }
 memchr = "2.8"
@@ -23,6 +25,7 @@ wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
 [patch.crates-io]
+libghostty-vt = { path = "vendor/libghostty-vt" }
 libghostty-vt-sys = { path = "vendor/libghostty-vt-sys" }
 
 [profile.release]

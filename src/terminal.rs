@@ -19,6 +19,7 @@ use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::config::{Color, Config, CursorShape};
 use crate::geometry::GridGeometry;
+use crate::graphics::placeholders::PlaceholderCell;
 use crate::graphics::{GraphicsCapture, GraphicsSnapshot};
 use crate::input::{InputResult, InputState, PointerEvent};
 use crate::links::HoverState;
@@ -137,6 +138,8 @@ impl SnapshotBuilder {
         terminal: &Terminal<'static, '_>,
         config: &Config,
     ) -> Result<TerminalSnapshot, libghostty_vt::Error> {
+        self.graphics.advance(terminal)?;
+        let pixels = terminal.pixel_size()?;
         capture_snapshot(
             terminal,
             &mut self.render_state,
@@ -144,7 +147,21 @@ impl SnapshotBuilder {
             &mut self.cell_iterator,
             &mut self.graphics,
             config,
+            [
+                pixels[0] / u32::from(terminal.cols()?.max(1)),
+                pixels[1] / u32::from(terminal.rows()?.max(1)),
+            ],
         )
+    }
+
+    pub fn write(
+        &mut self,
+        terminal: &mut Terminal<'static, '_>,
+        config: &Config,
+        data: &[u8],
+        reply: &mut dyn FnMut(&[u8]),
+    ) {
+        self.graphics.write(terminal, config, data, reply);
     }
 }
 
@@ -155,6 +172,7 @@ fn capture_snapshot(
     cell_iterator: &mut CellIterator<'static>,
     graphics: &mut GraphicsCapture,
     config: &Config,
+    cell_size: [u32; 2],
 ) -> Result<TerminalSnapshot, libghostty_vt::Error> {
     let snapshot = render_state.update(terminal)?;
     let cols = snapshot.cols()?;
@@ -176,6 +194,7 @@ fn capture_snapshot(
         shape: cursor_shape,
     });
     let mut cells = Vec::with_capacity(usize::from(cols) * usize::from(rows));
+    let mut placeholders = Vec::new();
     let mut rows_view = row_iterator.update(&snapshot)?;
     while let Some(row_view) = rows_view.next() {
         let mut cells_view = cell_iterator.update(row_view)?;
@@ -188,6 +207,16 @@ fn capture_snapshot(
                 CellWide::SpacerTail | CellWide::SpacerHead => 0,
             };
             let style = cell_view.style()?;
+            if let Some(placeholder) = PlaceholderCell::from_text(
+                (cells.len() % usize::from(cols)) as u16,
+                (cells.len() / usize::from(cols)) as u16,
+                &text,
+                style.fg_color,
+                style.underline_color,
+            ) {
+                placeholders.push(placeholder);
+                text.clear();
+            }
             let mut foreground = cell_view
                 .fg_color()?
                 .map(Rgb::from)
@@ -238,7 +267,7 @@ fn capture_snapshot(
             ..CursorSnapshot::default()
         }),
         mouse_reporting: terminal.is_mouse_tracking()?,
-        graphics: graphics.update(terminal)?,
+        graphics: graphics.update(terminal, config, &placeholders, cell_size)?,
     })
 }
 
@@ -571,6 +600,7 @@ fn run_terminal(
             cell_iterator,
             &mut graphics_capture.borrow_mut(),
             config,
+            [report_size.get().cell_width, report_size.get().cell_height],
         )?;
         snapshot_tx.send(terminal_snapshot);
         snapshot_pending.set(false);
@@ -589,6 +619,9 @@ fn run_terminal(
     )?;
 
     loop {
+        if graphics_capture.borrow_mut().advance(&terminal)? {
+            snapshot_pending.set(true);
+        }
         if synchronized_until
             .get()
             .is_some_and(|deadline| Instant::now() >= deadline)
@@ -624,6 +657,7 @@ fn run_terminal(
             }),
             input.pending_link_deadline(),
             input.autoscroll_deadline(&terminal, size)?,
+            graphics_capture.borrow().deadline(&terminal),
         ]
         .into_iter()
         .flatten()
@@ -639,7 +673,11 @@ fn run_terminal(
         match command {
             Ok(Command::Output(data)) => {
                 crate::diagnostics::trace("pty-output");
-                terminal.vt_write(&data);
+                graphics_capture
+                    .borrow_mut()
+                    .write(&mut terminal, &config, &data, &mut |reply| {
+                        let _ = writer.borrow_mut().write_all(reply);
+                    });
                 let sync_generation = input.synchronized_output_generation();
                 let result = input.observe_output(&terminal, &config, &data)?;
                 if input.synchronized_output_generation() != sync_generation {

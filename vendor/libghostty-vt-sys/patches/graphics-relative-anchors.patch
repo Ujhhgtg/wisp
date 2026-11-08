@@ -1,0 +1,53 @@
+--- a/src/terminal/kitty/graphics_storage.zig
++++ b/src/terminal/kitty/graphics_storage.zig
+@@ -851,6 +851,10 @@
+                         }
+                     }
+                     const key = key_ orelse return null;
++                    const image = storage.images.getPtr(key.image_id) orelse return null;
++                    const cell_width = t.width_px / t.cols;
++                    const cell_height = t.height_px / t.rows;
++                    if (cell_width == 0 or cell_height == 0) return null;
+                     var placements = @import("graphics_unicode.zig").placementIterator(
+                         pages.getTopLeft(.viewport),
+                         pages.getBottomRight(.viewport),
+@@ -860,10 +864,24 @@
+                         if (placement.image_id != key.image_id) continue;
+                         if (placement.placement_id != 0 and
+                             (key.placement_id.tag != .external or placement.placement_id != key.placement_id.id)) continue;
++                        if (placement.placement_id == 0) {
++                            var prototypes = storage.placements.iterator();
++                            var selected: ?*const Placement = null;
++                            while (prototypes.next()) |entry| {
++                                if (entry.key_ptr.image_id == key.image_id and entry.value_ptr.location == .virtual) {
++                                    selected = entry.value_ptr;
++                                    break;
++                                }
++                            }
++                            if (selected != self) continue;
++                        }
++                        const rendered = placement.renderPlacement(storage, image, cell_width, cell_height) catch continue;
++                        if (rendered.dest_width == 0 or rendered.dest_height == 0) continue;
+                         const position = pages.pointFromPin(.screen, placement.pin) orelse continue;
+                         const current: [2]i32 = .{
+-                            @intCast(position.screen.x),
+-                            @as(i32, @intCast(position.screen.y)) - @as(i32, @intCast(viewport.screen.y)),
++                            std.math.cast(i32, @as(u64, position.screen.x) + rendered.offset_x / cell_width) orelse continue,
++                            @as(i32, @intCast(position.screen.y)) - @as(i32, @intCast(viewport.screen.y)) +
++                                @as(i32, @intCast(rendered.offset_y / cell_height)),
+                         };
+                         if (origin) |*previous| {
+                             previous[0] = @min(previous[0], current[0]);
+--- a/src/terminal/c/kitty_graphics.zig
++++ b/src/terminal/c/kitty_graphics.zig
+@@ -1619,6 +1619,10 @@
+     terminal_c.vt_write(t, virtual.ptr, virtual.len);
+     try testing.expectEqual([2]i32{ 12, 5 }, storage.placements.getPtr(child_key).?.viewportOrigin(term, 0).?);
+ 
++    const outside = "\x1b[1;1H\x1b[38;5;103;58;5;3m\u{10eeee}\u{34a}\u{305}\x1b[m";
++    terminal_c.vt_write(t, outside.ptr, outside.len);
++    try testing.expectEqual([2]i32{ 12, 5 }, storage.placements.getPtr(child_key).?.viewportOrigin(term, 0).?);
++
+     const remove = "\x1b_Ga=d,d=i,i=103,p=3\x1b\\";
+     terminal_c.vt_write(t, remove.ptr, remove.len);
+     try testing.expect(storage.parentKey(102, 2) == null);

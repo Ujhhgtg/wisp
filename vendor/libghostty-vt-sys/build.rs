@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -5,6 +6,17 @@ use std::process::Command;
 /// Pinned ghostty commit. Update this to pull a newer version.
 const GHOSTTY_REPO: &str = "https://github.com/ghostty-org/ghostty.git";
 const GHOSTTY_COMMIT: &str = "a887df42c56f6de86c0fe6da9c4eeca37931e083";
+
+const WISP_PATCHES: &[&str] = &[
+    "grapheme-map.patch",
+    "repeat-character.patch",
+    "graphics-conformance.patch",
+    "graphics-relative.patch",
+    "graphics-relative-limits.patch",
+    "graphics-replace.patch",
+    "graphics-relative-anchors.patch",
+    "graphics-geometry.patch",
+];
 
 /// File name of the static archive on Windows. Ghostty installs it under this
 /// name for every Windows ABI so it does not collide with `ghostty-vt.lib`,
@@ -89,8 +101,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=DEBUG");
     println!("cargo:rerun-if-env-changed=OPT_LEVEL");
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=patches/grapheme-map.patch");
-    println!("cargo:rerun-if-changed=patches/repeat-character.patch");
+    for name in WISP_PATCHES {
+        println!("cargo:rerun-if-changed=patches/{name}");
+    }
 
     // An explicit source override should stay authoritative even when the
     // pkg-config feature is enabled, so local Ghostty checkouts remain easy to
@@ -130,8 +143,7 @@ fn build_vendored(link_mode: LinkMode, target: &str) {
         }
         Err(_) => {
             let source = fetch_ghostty(&out_dir);
-            apply_native_patch(&source, "grapheme-map.patch");
-            apply_native_patch(&source, "repeat-character.patch");
+            apply_native_patches(&source);
             source
         }
     };
@@ -355,22 +367,42 @@ fn zig_optimize_mode() -> &'static str {
     }
 }
 
-fn apply_native_patch(source: &Path, name: &str) {
-    let patch = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("patches")
-        .join(name);
-    let already_applied = Command::new("git")
-        .args(["apply", "--reverse", "--check"])
-        .arg(&patch)
-        .current_dir(source)
-        .output()
-        .expect("failed to check Ghostty native patch");
-    if already_applied.status.success() {
+fn apply_native_patches(source: &Path) {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("patches");
+    let mut combined = String::new();
+    for name in WISP_PATCHES {
+        combined.push_str(name);
+        combined.push('\n');
+        combined.push_str(
+            &std::fs::read_to_string(directory.join(name))
+                .unwrap_or_else(|error| panic!("failed to read {name}: {error}")),
+        );
+    }
+    let stamp = source.join(".wisp-patches");
+    let previous = std::fs::read_to_string(&stamp).unwrap_or_default();
+    if previous == combined {
         return;
     }
-    let mut apply = Command::new("git");
-    apply.arg("apply").arg(&patch).current_dir(source);
-    run(apply, "apply Ghostty native patch");
+    let paths = previous
+        .lines()
+        .chain(combined.lines())
+        .filter_map(|line| line.strip_prefix("+++ b/"))
+        .collect::<BTreeSet<_>>();
+    let mut restore = Command::new("git");
+    restore
+        .args(["restore", "--source", GHOSTTY_COMMIT, "--worktree", "--"])
+        .args(paths)
+        .current_dir(source);
+    run(restore, "restore managed Ghostty patch files");
+    for name in WISP_PATCHES {
+        let mut apply = Command::new("git");
+        apply
+            .arg("apply")
+            .arg(directory.join(name))
+            .current_dir(source);
+        run(apply, "apply Ghostty native patch");
+    }
+    std::fs::write(stamp, combined).expect("failed to record Ghostty patch set");
 }
 
 /// Clone ghostty at the pinned commit into OUT_DIR/ghostty-src.

@@ -1,0 +1,211 @@
+diff --git a/include/ghostty/vt/kitty_graphics.h b/include/ghostty/vt/kitty_graphics.h
+--- a/include/ghostty/vt/kitty_graphics.h
++++ b/include/ghostty/vt/kitty_graphics.h
+@@ -510,6 +510,10 @@ GHOSTTY_API GhosttyKittyGraphicsImage ghostty_kitty_graphics_image(
+     GhosttyKittyGraphics graphics,
+     uint32_t image_id);
+ 
++GHOSTTY_API GhosttyKittyGraphicsImage wisp_kitty_graphics_image_by_number(
++    GhosttyKittyGraphics graphics,
++    uint32_t image_number);
++
+ /**
+  * Get data from a Kitty graphics image.
+  *
+diff --git a/src/lib_vt.zig b/src/lib_vt.zig
+--- a/src/lib_vt.zig
++++ b/src/lib_vt.zig
+@@ -291,6 +291,7 @@ comptime {
+         @export(&c.terminal_point_from_grid_ref, .{ .name = "ghostty_terminal_point_from_grid_ref" });
+         @export(&c.kitty_graphics_get, .{ .name = "ghostty_kitty_graphics_get" });
+         @export(&c.kitty_graphics_image, .{ .name = "ghostty_kitty_graphics_image" });
++        @export(&c.kitty_graphics_image_by_number, .{ .name = "wisp_kitty_graphics_image_by_number" });
+         @export(&c.kitty_graphics_image_get, .{ .name = "ghostty_kitty_graphics_image_get" });
+         @export(&c.kitty_graphics_image_get_multi, .{ .name = "ghostty_kitty_graphics_image_get_multi" });
+         @export(&c.kitty_graphics_placement_iterator_new, .{ .name = "ghostty_kitty_graphics_placement_iterator_new" });
+diff --git a/src/terminal/c/kitty_graphics.zig b/src/terminal/c/kitty_graphics.zig
+--- a/src/terminal/c/kitty_graphics.zig
++++ b/src/terminal/c/kitty_graphics.zig
+@@ -206,6 +206,30 @@ pub fn image_get_handle(
+     return storage.images.getPtr(image_id);
+ }
+ 
++pub fn image_by_number(
++    graphics_: KittyGraphics,
++    image_number: u32,
++) callconv(lib.calling_conv) ImageHandle {
++    if (comptime !build_options.kitty_graphics) return null;
++
++    const storage = graphics_;
++    const image = storage.imageByNumber(image_number) orelse return null;
++    return storage.images.getPtr(image.id);
++}
++
++test "image_by_number borrows the newest image and reports missing numbers" {
++    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
++
++    const alloc = testing.allocator;
++    var t = try Terminal.init(alloc, .{ .cols = 8, .rows = 4 });
++    defer t.deinit(alloc);
++    const storage = &t.screens.active.kitty_images;
++    try storage.addImage(alloc, .{ .id = 11, .number = 9, .width = 1, .height = 1 });
++    try storage.addImage(alloc, .{ .id = 12, .number = 9, .width = 2, .height = 1 });
++    try testing.expectEqual(storage.images.getPtr(12), image_by_number(storage, 9));
++    try testing.expect(image_by_number(storage, 8) == null);
++}
++
+ pub fn image_get(
+     image_: ImageHandle,
+     data: ImageData,
+diff --git a/src/terminal/c/main.zig b/src/terminal/c/main.zig
+--- a/src/terminal/c/main.zig
++++ b/src/terminal/c/main.zig
+@@ -13,6 +13,7 @@ pub const grid_ref_tracked = @import("grid_ref_tracked.zig");
+ pub const kitty_graphics = @import("kitty_graphics.zig");
+ pub const kitty_graphics_get = kitty_graphics.get;
+ pub const kitty_graphics_image = kitty_graphics.image_get_handle;
++pub const kitty_graphics_image_by_number = kitty_graphics.image_by_number;
+ pub const kitty_graphics_image_get = kitty_graphics.image_get;
+ pub const kitty_graphics_image_get_multi = kitty_graphics.image_get_multi;
+ pub const kitty_graphics_placement_iterator_new = kitty_graphics.placement_iterator_new;
+diff --git a/src/terminal/kitty/graphics_exec.zig b/src/terminal/kitty/graphics_exec.zig
+--- a/src/terminal/kitty/graphics_exec.zig
++++ b/src/terminal/kitty/graphics_exec.zig
+@@ -13,6 +13,54 @@ const ImageStorage = @import("graphics_storage.zig").ImageStorage;
+ 
+ const log = std.log.scoped(.kitty_gfx);
+ 
++test "kittygfx automatic ids skip explicit ids and zero after wrap" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++    const storage = &t.screens.active.kitty_images;
++
++    for ([_][]const u8{
++        "a=t,i=2147483647,f=32,s=1,v=1;/wAA/w==",
++        "a=t,I=9,f=32,s=1,v=1;AP8A/w==",
++        "a=t,i=4294967295,f=32,s=1,v=1;AAD//w==",
++    }) |input| {
++        const cmd = try command.Parser.parseString(alloc, input);
++        defer cmd.deinit(alloc);
++        const response = execute(alloc, &t, &cmd).?;
++        try testing.expect(response.ok());
++    }
++    try testing.expect(storage.imageById(2147483647) != null);
++    try testing.expectEqual(@as(u32, 2147483648), storage.imageByNumber(9).?.id);
++    storage.next_image_id = std.math.maxInt(u32);
++    const cmd = try command.Parser.parseString(alloc, "a=t,I=10,f=32,s=1,v=1;AAD//w==");
++    defer cmd.deinit(alloc);
++    const response = execute(alloc, &t, &cmd).?;
++    try testing.expect(response.ok());
++    try testing.expectEqual(@as(u32, 1), response.id);
++}
++
++test "kittygfx delete aborts a partial transmission before the next image" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++    const storage = &t.screens.active.kitty_images;
++
++    const partial = try command.Parser.parseString(alloc, "a=t,i=7,f=32,s=1,v=2,m=1;/wAA/w==");
++    defer partial.deinit(alloc);
++    try testing.expect(execute(alloc, &t, &partial) == null);
++    try testing.expect(storage.loading != null);
++    const erase = try command.Parser.parseString(alloc, "a=d,d=i,i=7");
++    defer erase.deinit(alloc);
++    try testing.expect(execute(alloc, &t, &erase) == null);
++    try testing.expect(storage.loading == null);
++    const replacement = try command.Parser.parseString(alloc, "a=t,i=8,f=32,s=1,v=1;AAD//w==");
++    defer replacement.deinit(alloc);
++    try testing.expect(execute(alloc, &t, &replacement).?.ok());
++    try testing.expectEqual(@as(usize, 4), storage.imageById(8).?.data.len);
++}
++
+ /// Execute a Kitty graphics command against the given terminal. This
+ /// will never fail, but the response may indicate an error and the
+ /// terminal state may not be updated to reflect the command. This will
+@@ -336,6 +384,9 @@ fn loadAndAddImage(
+ 
+     // If the image has no ID, we assign one
+     if (loading.image.id == 0) {
++        while (storage.next_image_id == 0 or storage.images.contains(storage.next_image_id)) {
++            storage.next_image_id +%= 1;
++        }
+         loading.image.id = storage.next_image_id;
+         storage.next_image_id +%= 1;
+ 
+diff --git a/src/terminal/kitty/graphics_storage.zig b/src/terminal/kitty/graphics_storage.zig
+--- a/src/terminal/kitty/graphics_storage.zig
++++ b/src/terminal/kitty/graphics_storage.zig
+@@ -16,6 +16,25 @@ const Command = command.Command;
+ 
+ const log = std.log.scoped(.kitty_gfx);
+ 
++test "storage: image id range deletion preserves ids on both sides" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++    var t = try terminal.Terminal.init(alloc, .{ .cols = 8, .rows = 4 });
++    defer t.deinit(alloc);
++    const storage = &t.screens.active.kitty_images;
++    for ([_]u32{ 10, 20, 30 }) |id| {
++        try storage.addImage(alloc, .{ .id = id, .width = 1, .height = 1 });
++        try storage.addPlacement(alloc, id, 1, .{
++            .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) },
++        });
++    }
++    storage.delete(alloc, &t, .{ .range = .{ .first = 20, .last = 20, .delete = true } });
++    try testing.expect(storage.imageById(10) != null);
++    try testing.expect(storage.imageById(20) == null);
++    try testing.expect(storage.imageById(30) != null);
++    try testing.expectEqual(@as(usize, 2), storage.placements.count());
++}
++
+ /// Process-global counter backing all generation stamps (see
+ /// ImageStorage.generation and Image.generation). This is global rather
+ /// than per-storage so that stamps are unique across every storage in
+@@ -314,6 +333,10 @@ pub const ImageStorage = struct {
+         t: *terminal.Terminal,
+         cmd: command.Delete,
+     ) void {
++        if (self.loading) |loading| {
++            loading.destroy(alloc);
++            self.loading = null;
++        }
+         // Deletes only ever remove placements/images, so comparing counts
+         // before and after tells us whether anything actually changed.
+         // Only then do we mark a mutation. This matters because a
+@@ -503,7 +526,7 @@ pub const ImageStorage = struct {
+ 
+                 var it = self.placements.iterator();
+                 while (it.next()) |entry| {
+-                    if (entry.key_ptr.image_id >= v.first or entry.key_ptr.image_id <= v.last) {
++                    if (entry.key_ptr.image_id >= v.first and entry.key_ptr.image_id <= v.last) {
+                         const image_id = entry.key_ptr.image_id;
+                         entry.value_ptr.deinit(t.screens.active);
+                         self.placements.removeByPtr(entry.key_ptr);
+@@ -1378,8 +1401,8 @@ test "storage: delete images by range 3" {
+     s.delete(alloc, &t, .{ .range = .{ .delete = false, .first = 1, .last = 1 } });
+     try testing.expect(s.dirty);
+     try testing.expectEqual(@as(usize, 3), s.images.count());
+-    try testing.expectEqual(@as(usize, 0), s.placements.count());
+-    try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
++    try testing.expectEqual(@as(usize, 1), s.placements.count());
++    try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
+ }
+ 
+ test "storage: delete images by range 4" {
+@@ -1402,9 +1425,9 @@ test "storage: delete images by range 4" {
+     s.dirty = false;
+     s.delete(alloc, &t, .{ .range = .{ .delete = true, .first = 1, .last = 1 } });
+     try testing.expect(s.dirty);
+-    try testing.expectEqual(@as(usize, 1), s.images.count());
+-    try testing.expectEqual(@as(usize, 0), s.placements.count());
+-    try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
++    try testing.expectEqual(@as(usize, 2), s.images.count());
++    try testing.expectEqual(@as(usize, 1), s.placements.count());
++    try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
+ }
+ 
+ test "storage: aspect ratio calculation when only columns or rows specified" {
