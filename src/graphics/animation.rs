@@ -514,7 +514,7 @@ fn render_overlay(
             .to_vec(),
         None => {
             let mut pixels = vec![0; image_bytes(width, height)?];
-            for pixel in pixels.chunks_exact_mut(4) {
+            for pixel in pixels.as_chunks_mut::<4>().0 {
                 pixel.copy_from_slice(&overlay.background);
             }
             pixels
@@ -590,7 +590,12 @@ fn blend_row(destination: &mut [u8], source: &[u8], replace: bool) {
         destination.copy_from_slice(source);
         return;
     }
-    for (under, over) in destination.chunks_exact_mut(4).zip(source.chunks_exact(4)) {
+    for (under, over) in destination
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(source.as_chunks::<4>().0)
+    {
         let alpha = u32::from(over[3]);
         if alpha == 255 {
             under.copy_from_slice(over);

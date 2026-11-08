@@ -130,11 +130,7 @@ fn axis_geometry(surface: u32, cell: u32, before: u32, after: u32) -> (u32, u16,
     let maximum_margin = surface.saturating_sub(cell.min(surface));
     let requested_margin = u64::from(before) + u64::from(after);
     let (before, after) = if requested_margin > u64::from(maximum_margin) {
-        let before = if requested_margin == 0 {
-            0
-        } else {
-            (u64::from(before) * u64::from(maximum_margin) / requested_margin) as u32
-        };
+        let before = (u64::from(before) * u64::from(maximum_margin) / requested_margin) as u32;
         (before, maximum_margin - before)
     } else {
         (before, after)

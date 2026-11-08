@@ -101,7 +101,9 @@ fn inline_entry_matches(value: Option<&std::ffi::OsStr>, name: &str) -> bool {
         }
         encoded
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let digits = std::str::from_utf8(pair).ok()?;
                 u8::from_str_radix(digits, 16).ok()

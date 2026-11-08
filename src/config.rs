@@ -356,18 +356,13 @@ pub struct WindowConfig {
     pub margin_width: Margins,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CursorShape {
     Block,
+    #[default]
     Beam,
     Underline,
-}
-
-impl Default for CursorShape {
-    fn default() -> Self {
-        Self::Beam
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -263,7 +263,7 @@ impl Protocol {
         let continuation = self.pending.as_ref().is_some_and(|pending| {
             matches!(action, b'f' | b't')
                 && !fields.0.contains_key(&b'f')
-                && [b'i', b'I'].into_iter().all(|key| {
+                && b"iI".iter().copied().all(|key| {
                     fields.number(key).unwrap_or(u32::MAX) == 0
                         || fields.number(key).ok() == pending.fields.number(key).ok()
                 })

@@ -20,8 +20,10 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if repetitions == 0 || columns == 0 || rows == 0 {
         return Err("repetitions, columns and rows must be positive".into());
     }
-    let mut config = Config::default();
-    config.scrollback_limit = 10_000;
+    let config = Config {
+        scrollback_limit: 10_000,
+        ..Default::default()
+    };
     let unique = unique_combining_payload();
     let repeated = "a\u{300}\u{300}\u{300}".repeat(256 * 1024).into_bytes();
     let ascii = vec![b'a'; unique.len()];

@@ -368,11 +368,11 @@ fn kitten_icat_auto_stream_file_and_shared_memory_display_real_image() {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut captured = None;
         while Instant::now() < deadline {
-            if let Some(snapshot) = session.try_snapshot() {
-                if !snapshot.graphics.placements.is_empty() {
-                    captured = Some(snapshot.graphics);
-                    break;
-                }
+            if let Some(snapshot) = session.try_snapshot()
+                && !snapshot.graphics.placements.is_empty()
+            {
+                captured = Some(snapshot.graphics);
+                break;
             }
             thread::sleep(Duration::from_millis(2));
         }

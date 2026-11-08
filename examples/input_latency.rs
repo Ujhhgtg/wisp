@@ -110,13 +110,12 @@ fn run(samples: u16, interval: Duration) -> Result<(), Box<dyn Error + Send + Sy
                     _ => {}
                 }
             }
-            if let Some(frame) = session.try_snapshot() {
-                if frame.cursor.column == sample
-                    && frame.cursor.row == 0
-                    && frame.cells[usize::from(sample - 1)].text == "x"
-                {
-                    snapshot = Some(sent.elapsed());
-                }
+            if let Some(frame) = session.try_snapshot()
+                && frame.cursor.column == sample
+                && frame.cursor.row == 0
+                && frame.cells[usize::from(sample - 1)].text == "x"
+            {
+                snapshot = Some(sent.elapsed());
             }
             if echo.is_none() || snapshot.is_none() {
                 let _ = wake_rx.recv_timeout(Duration::from_millis(2));

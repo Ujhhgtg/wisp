@@ -485,10 +485,10 @@ impl Renderer {
             .layout
             .set_blink_visible(blink_visible(self.text_blink_epoch, now))
         {
-            if let Some(snapshot) = &self.snapshot {
-                if self.layout.shape(snapshot)? {
-                    self.reset_atlas();
-                }
+            if let Some(snapshot) = &self.snapshot
+                && self.layout.shape(snapshot)?
+            {
+                self.reset_atlas();
             }
             self.text_prepared = false;
         }
@@ -1517,7 +1517,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let pixels = region(&focused);
-        assert!(pixels.iter().any(|pixel| *pixel == [255, 0, 0, 255]));
+        assert!(pixels.contains(&[255, 0, 0, 255]));
         assert!(
             pixels
                 .iter()
@@ -1749,7 +1749,7 @@ mod tests {
                     let cell = column / geometry.cell_width;
                     if cell == 3 {
                         assert_eq!([actual[1], actual[2]], [0, 0]);
-                    } else if cell % 2 == 0 {
+                    } else if cell.is_multiple_of(2) {
                         assert_eq!([actual[0], actual[2]], [0, 0]);
                     } else {
                         assert_eq!(actual[0], actual[1]);

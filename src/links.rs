@@ -220,11 +220,12 @@ fn read_links(terminal: &Terminal<'_, '_>, row: u16) -> Result<CachedLines, Erro
 }
 
 fn extend_spans(spans: &mut Vec<LinkSpan>, cell: &MappedCell) {
-    if let Some(span) = spans.last_mut() {
-        if span.row == cell.row && span.end == cell.column {
-            span.end += cell.width;
-            return;
-        }
+    if let Some(span) = spans.last_mut()
+        && span.row == cell.row
+        && span.end == cell.column
+    {
+        span.end += cell.width;
+        return;
     }
     spans.push(LinkSpan {
         row: cell.row,
@@ -874,7 +875,7 @@ mod tests {
 
     #[test]
     fn ignored_dcs_apc_and_pm_payloads_cannot_change_pointer_shapes() {
-        for introducer in [b'P', b'_', b'^'] {
+        for introducer in *b"P_^" {
             let mut shapes = PointerShapes::default();
             shapes.observe(b"\x1b]22;pointer\x1b\\");
             shapes.observe(&[0x1b, introducer]);
@@ -912,7 +913,7 @@ mod tests {
     fn synchronized_output_generation_ignores_string_payloads_and_counts_duplicate_parameters_once()
     {
         let mut shapes = PointerShapes::default();
-        for introducer in [b']', b'P', b'_', b'^'] {
+        for introducer in *b"]P_^" {
             shapes.observe(&[0x1b, introducer]);
             shapes.observe(b"0;payload\x1b[?2026h");
             shapes.observe(b"\x1b");

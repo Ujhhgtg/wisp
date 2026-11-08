@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[lints.clippy]
+too_many_arguments = "allow"
+
 [dependencies]
 arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
 bytemuck = { version = "1.23", features = ["derive"] }

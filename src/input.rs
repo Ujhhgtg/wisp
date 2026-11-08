@@ -283,29 +283,29 @@ impl InputState {
                     immediate,
                 });
                 if immediate {
-                    let mut result = InputResult::default();
-                    result.hover =
-                        self.hover(terminal, config, size, event.x, event.y, event.mods)?;
-                    return Ok(result);
+                    return Ok(InputResult {
+                        hover: self.hover(terminal, config, size, event.x, event.y, event.mods)?,
+                        ..Default::default()
+                    });
                 }
             } else {
                 self.link_press = None;
             }
         }
-        if event.action == mouse::Action::Release && event.button == Some(mouse::Button::Left) {
-            if self
+        if event.action == mouse::Action::Release
+            && event.button == Some(mouse::Button::Left)
+            && self
                 .link_press
                 .as_ref()
                 .is_some_and(|press| press.immediate)
-            {
-                let press = self.link_press.take().expect("immediate link press");
-                let mut result = InputResult::default();
-                if point == press.point {
-                    result.open_url = press.target.map(|target| target.uri);
-                }
-                result.hover = self.hover(terminal, config, size, event.x, event.y, event.mods)?;
-                return Ok(result);
+        {
+            let press = self.link_press.take().expect("immediate link press");
+            let mut result = InputResult::default();
+            if point == press.point {
+                result.open_url = press.target.map(|target| target.uri);
             }
+            result.hover = self.hover(terminal, config, size, event.x, event.y, event.mods)?;
+            return Ok(result);
         }
         let mut result = if self.drag.is_some() || !tracking || override_grab {
             self.local_pointer(terminal, config, size, event, time, tracking)?
@@ -336,19 +336,17 @@ impl InputState {
             }
             result
         };
-        if event.action == mouse::Action::Release && event.button == Some(mouse::Button::Left) {
-            if let Some(press) = self.link_press.take() {
-                if point == press.point
-                    && time.saturating_sub(press.time) <= CLICK_INTERVAL
-                    && self.selection.is_none()
-                    && self.gesture.click_count(terminal)? == 1
-                    && !self.gesture.dragged(terminal)?
-                {
-                    if let Some(target) = press.target {
-                        self.pending_link = Some((time + CLICK_INTERVAL, target.uri));
-                    }
-                }
-            }
+        if event.action == mouse::Action::Release
+            && event.button == Some(mouse::Button::Left)
+            && let Some(press) = self.link_press.take()
+            && point == press.point
+            && time.saturating_sub(press.time) <= CLICK_INTERVAL
+            && self.selection.is_none()
+            && self.gesture.click_count(terminal)? == 1
+            && !self.gesture.dragged(terminal)?
+            && let Some(target) = press.target
+        {
+            self.pending_link = Some((time + CLICK_INTERVAL, target.uri));
         }
         result.hover = self.hover(terminal, config, size, event.x, event.y, event.mods)?;
         Ok(result)
@@ -391,10 +389,9 @@ impl InputState {
         let link = if config.protocols.hyperlinks
             && dragging.is_none()
             && clickable_modifiers(tracking, mods)
-            && point.is_some()
+            && let Some(point) = point
         {
-            self.links
-                .lookup(terminal, point.expect("hovered grid cell"))?
+            self.links.lookup(terminal, point)?
         } else {
             None
         };

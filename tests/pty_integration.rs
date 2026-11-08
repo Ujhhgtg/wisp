@@ -46,7 +46,9 @@ fn finish(session: &Session) -> Vec<u8> {
     let title = wait_title(session, "probe-result:");
     let hex = title.strip_prefix("probe-result:").unwrap();
     hex.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect()
 }
@@ -361,11 +363,11 @@ fn real_pointer_selection_copies_text_and_typing_clears_the_highlight() {
     let deadline = Instant::now() + Duration::from_secs(4);
     let mut cleared = false;
     while Instant::now() < deadline {
-        if let Some(snapshot) = session.try_snapshot() {
-            if snapshot.cells.iter().all(|cell| !cell.selected) {
-                cleared = true;
-                break;
-            }
+        if let Some(snapshot) = session.try_snapshot()
+            && snapshot.cells.iter().all(|cell| !cell.selected)
+        {
+            cleared = true;
+            break;
         }
         thread::sleep(Duration::from_millis(2));
     }

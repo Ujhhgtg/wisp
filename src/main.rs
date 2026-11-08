@@ -200,32 +200,30 @@ impl WispApp {
                 }
                 terminal::SessionEvent::Clipboard(text) => {
                     wisp::diagnostics::trace("clipboard-write");
-                    if let Some(clipboard) = self.clipboard.as_mut() {
-                        if let Err(error) = clipboard.set_text(text) {
-                            eprintln!("failed to copy to clipboard: {error}");
-                        }
+                    if let Some(clipboard) = self.clipboard.as_mut()
+                        && let Err(error) = clipboard.set_text(text)
+                    {
+                        eprintln!("failed to copy to clipboard: {error}");
                     }
                 }
                 terminal::SessionEvent::PrimarySelection(text) => {
-                    if let Some(clipboard) = self.clipboard.as_mut() {
-                        if let Err(error) = clipboard
+                    if let Some(clipboard) = self.clipboard.as_mut()
+                        && let Err(error) = clipboard
                             .set()
                             .clipboard(LinuxClipboardKind::Primary)
                             .text(text)
-                        {
-                            eprintln!("failed to copy primary selection: {error}");
-                        }
+                    {
+                        eprintln!("failed to copy primary selection: {error}");
                     }
                 }
                 terminal::SessionEvent::PastePrimary => {
-                    if let Some(clipboard) = self.clipboard.as_mut() {
-                        if let Ok(text) = clipboard
+                    if let Some(clipboard) = self.clipboard.as_mut()
+                        && let Ok(text) = clipboard
                             .get()
                             .clipboard(LinuxClipboardKind::Primary)
                             .text()
-                        {
-                            session.send(Command::Paste(text));
-                        }
+                    {
+                        session.send(Command::Paste(text));
                     }
                 }
                 terminal::SessionEvent::Error(error) => {
@@ -255,22 +253,21 @@ impl WispApp {
                 terminal::SessionEvent::Exited => event_loop.exit(),
             }
         }
-        if let Some(renderer) = self.renderer.as_mut() {
-            if matches!(renderer.render(), renderer::RenderOutcome::Reconfigure) {
-                if let Some(window) = self.window.as_ref() {
-                    renderer.resize(window.inner_size());
-                }
-            }
+        if let Some(renderer) = self.renderer.as_mut()
+            && matches!(renderer.render(), renderer::RenderOutcome::Reconfigure)
+            && let Some(window) = self.window.as_ref()
+        {
+            renderer.resize(window.inner_size());
         }
     }
 }
 
 impl ApplicationHandler<UserEvent> for WispApp {
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
-        if matches!(cause, StartCause::ResumeTimeReached { .. }) {
-            if let Some(window) = self.window.as_ref() {
-                window.request_redraw();
-            }
+        if matches!(cause, StartCause::ResumeTimeReached { .. })
+            && let Some(window) = self.window.as_ref()
+        {
+            window.request_redraw();
         }
     }
 
@@ -375,10 +372,11 @@ impl ApplicationHandler<UserEvent> for WispApp {
                     ElementState::Pressed => libghostty_vt::key::Action::Press,
                     ElementState::Released => libghostty_vt::key::Action::Release,
                 };
-                if let PhysicalKey::Code(code) = event.physical_key {
-                    if event.state == ElementState::Released && self.consumed_keys.remove(&code) {
-                        return;
-                    }
+                if let PhysicalKey::Code(code) = event.physical_key
+                    && event.state == ElementState::Released
+                    && self.consumed_keys.remove(&code)
+                {
+                    return;
                 }
                 if event.state == ElementState::Pressed
                     && self.modifiers.shift_key()
@@ -421,10 +419,10 @@ impl ApplicationHandler<UserEvent> for WispApp {
                         }
                         Some(KeyCode::KeyV) => {
                             wisp::diagnostics::trace("clipboard-paste-key");
-                            if let Some(clipboard) = self.clipboard.as_mut() {
-                                if let Ok(text) = clipboard.get_text() {
-                                    self.send(Command::Paste(text));
-                                }
+                            if let Some(clipboard) = self.clipboard.as_mut()
+                                && let Ok(text) = clipboard.get_text()
+                            {
+                                self.send(Command::Paste(text));
                             }
                             return;
                         }
@@ -592,10 +590,10 @@ impl ApplicationHandler<UserEvent> for WispApp {
             .and_then(renderer::Renderer::next_frame_deadline)
         {
             event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-            if deadline <= Instant::now() {
-                if let Some(window) = self.window.as_ref() {
-                    window.request_redraw();
-                }
+            if deadline <= Instant::now()
+                && let Some(window) = self.window.as_ref()
+            {
+                window.request_redraw();
             }
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
@@ -621,17 +619,17 @@ fn map_modifiers(modifiers: ModifiersState) -> libghostty_vt::key::Mods {
 }
 
 fn terminal_shortcut(logical: Key, physical: PhysicalKey) -> Option<KeyCode> {
-    if let Key::Character(text) = logical {
-        if text.is_ascii() {
-            return match text.to_ascii_lowercase().as_str() {
-                "c" => Some(KeyCode::KeyC),
-                "v" => Some(KeyCode::KeyV),
-                "=" | "+" => Some(KeyCode::Equal),
-                "-" => Some(KeyCode::Minus),
-                "0" => Some(KeyCode::Digit0),
-                _ => None,
-            };
-        }
+    if let Key::Character(text) = logical
+        && text.is_ascii()
+    {
+        return match text.to_ascii_lowercase().as_str() {
+            "c" => Some(KeyCode::KeyC),
+            "v" => Some(KeyCode::KeyV),
+            "=" | "+" => Some(KeyCode::Equal),
+            "-" => Some(KeyCode::Minus),
+            "0" => Some(KeyCode::Digit0),
+            _ => None,
+        };
     }
     match physical {
         PhysicalKey::Code(

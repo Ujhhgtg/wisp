@@ -50,8 +50,10 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         return Err("payload size must be between 1 and 256 MiB".into());
     }
     let payload = make_payload(mebibytes * 1024 * 1024);
-    let mut config = Config::default();
-    config.scrollback_limit = 0;
+    let config = Config {
+        scrollback_limit: 0,
+        ..Default::default()
+    };
 
     let mut terminal = Terminal::new(TerminalOptions {
         cols: COLUMNS,

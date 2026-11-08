@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::env;
 use std::io::{Read, Write};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -511,10 +511,7 @@ impl Session {
     }
 
     pub fn try_event(&self) -> Option<SessionEvent> {
-        match self.event_rx.try_recv() {
-            Ok(event) => Some(event),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
-        }
+        self.event_rx.try_recv().ok()
     }
 }
 
@@ -1038,10 +1035,10 @@ fn run_terminal(
             Ok(Command::CopySelection) => {
                 if let Some(text) = input.selection_text(&terminal)? {
                     let _ = event_tx.send(SessionEvent::Clipboard(text));
-                } else if let Some(bounds) = selection {
-                    if let Some(text) = format_selection(&terminal, bounds)? {
-                        let _ = event_tx.send(SessionEvent::Clipboard(text));
-                    }
+                } else if let Some(bounds) = selection
+                    && let Some(text) = format_selection(&terminal, bounds)?
+                {
+                    let _ = event_tx.send(SessionEvent::Clipboard(text));
                 }
             }
             Ok(Command::Focus(focused)) => {

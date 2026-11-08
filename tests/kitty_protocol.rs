@@ -75,7 +75,9 @@ impl Probe {
         let hex = title.strip_prefix(&prefix).unwrap();
         let bytes = hex
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect::<Vec<_>>();
         let text = std::str::from_utf8(&bytes).unwrap();
@@ -102,10 +104,10 @@ impl Probe {
     fn frame(&self, predicate: impl Fn(&TerminalSnapshot) -> bool) -> TerminalSnapshot {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            if let Some(frame) = self.session.try_snapshot() {
-                if predicate(&frame) {
-                    return frame;
-                }
+            if let Some(frame) = self.session.try_snapshot()
+                && predicate(&frame)
+            {
+                return frame;
             }
             assert!(
                 Instant::now() < deadline,

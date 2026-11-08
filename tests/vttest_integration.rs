@@ -26,10 +26,10 @@ fn wait_frame(
 ) -> TerminalSnapshot {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if let Some(frame) = session.try_snapshot() {
-            if predicate(&frame) {
-                return frame;
-            }
+        if let Some(frame) = session.try_snapshot()
+            && predicate(&frame)
+        {
+            return frame;
         }
         while let Some(event) = session.try_event() {
             match event {
