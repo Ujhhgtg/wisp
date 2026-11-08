@@ -20,6 +20,8 @@ boundaries are documented in [`docs/conformance.md`](docs/conformance.md).
 
 Graphics commands, resource limits, and validation instructions are documented in
 [`docs/kitty-graphics.md`](docs/kitty-graphics.md).
+Ligatures preserve per-cell colors across color and selection changes; see
+[`docs/text-rendering.md`](docs/text-rendering.md).
 
 ## configuration
 

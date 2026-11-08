@@ -1670,6 +1670,71 @@ mod tests {
     }
 
     #[test]
+    fn gpu_multicolor_ligatures_keep_the_same_shape_and_each_cells_color() {
+        let mut config = Config::default();
+        config.font.family = "FiraCode Nerd Font".to_owned();
+        config.colors.background = crate::config::Color::new(0, 0, 0);
+        config.colors.selection_background = crate::config::Color::new(0, 0, 0);
+        config.colors.selection_foreground = crate::config::Color::new(255, 0, 0);
+        let mut renderer = offscreen(config.clone());
+        let text = "~> -> != === <=>";
+        let mut frame = snapshot(&config, text.len() as u16, 1);
+        for (cell, character) in frame.cells.iter_mut().zip(text.chars()) {
+            cell.text = character.to_string();
+            cell.foreground = Rgb {
+                red: 255,
+                green: 255,
+                blue: 255,
+            };
+        }
+        renderer.set_snapshot(frame.clone());
+        let uniform = capture(&mut renderer);
+        for (index, cell) in frame.cells.iter_mut().enumerate() {
+            if index % 2 == 0 {
+                cell.foreground = Rgb {
+                    red: 0,
+                    green: 255,
+                    blue: 0,
+                };
+            }
+        }
+        frame.cells[3].selected = true;
+        renderer.set_snapshot(frame);
+        let colored = capture(&mut renderer);
+        let geometry = renderer.geometry();
+        let mut changed_cells = std::collections::HashSet::new();
+        for row in 0..geometry.cell_height {
+            for column in 0..geometry.cell_width * text.len() as u32 {
+                let x = geometry.origin_x + column;
+                let y = geometry.origin_y + row;
+                let original = pixel(&uniform, renderer.size.width, x, y);
+                let actual = pixel(&colored, renderer.size.width, x, y);
+                let intensity = actual[..3].iter().copied().max().unwrap();
+                assert!(
+                    original[0].abs_diff(intensity) <= 1,
+                    "ligature mask changed at {column},{row}: {original:?} vs {actual:?}"
+                );
+                if intensity > 32 {
+                    let cell = column / geometry.cell_width;
+                    if cell == 3 {
+                        assert_eq!([actual[1], actual[2]], [0, 0]);
+                    } else if cell % 2 == 0 {
+                        assert_eq!([actual[0], actual[2]], [0, 0]);
+                    } else {
+                        assert_eq!(actual[0], actual[1]);
+                        assert_eq!(actual[1], actual[2]);
+                    }
+                    changed_cells.insert(cell);
+                }
+            }
+        }
+        assert!(
+            changed_cells.contains(&0) && changed_cells.contains(&1),
+            "both halves of ~> must have visible pixels"
+        );
+    }
+
+    #[test]
     fn gpu_glyphs_and_cursor_share_grid_after_wide_and_combining_text() {
         let mut config = Config::default();
         config.font.family = "FiraCode Nerd Font".to_owned();

@@ -5,7 +5,7 @@ use std::process::Command;
 use glyphon::cosmic_text::{FeatureTag, FontFeatures};
 use glyphon::{
     Attrs, Buffer, CacheKey, Color, ContentType, CustomGlyph, Family, FontSystem, Metrics,
-    RasterizedCustomGlyph, Shaping, SwashCache, SwashContent, Weight, Wrap,
+    RasterizedCustomGlyph, Shaping, SwashCache, SwashContent, SwashImage, Weight, Wrap,
 };
 
 use crate::config::Config;
@@ -21,7 +21,6 @@ pub(super) struct CellMetrics {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RunStyle {
-    foreground: Rgb,
     bold: bool,
     italic: bool,
     hidden: bool,
@@ -32,6 +31,13 @@ struct CellBytes {
     bytes: Range<usize>,
     column: u16,
     width: u8,
+    foreground: Rgb,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct GlyphRasterKey {
+    cache_key: CacheKey,
+    columns: [u32; 2],
 }
 
 #[derive(Default)]
@@ -47,7 +53,7 @@ pub(super) struct TextLayout {
     pub family: String,
     pub glyphs: Vec<CustomGlyph>,
     pub images: HashMap<u16, RasterizedCustomGlyph>,
-    glyph_ids: HashMap<CacheKey, u16>,
+    glyph_ids: HashMap<GlyphRasterKey, u16>,
     pub empty_buffer: Buffer,
     shaping_buffer: Buffer,
     rows: Vec<CachedRow>,
@@ -139,11 +145,6 @@ impl TextLayout {
                     continue;
                 }
                 let cell_style = RunStyle {
-                    foreground: if cell.selected {
-                        self.selection_foreground
-                    } else {
-                        cell.foreground
-                    },
                     bold: cell.bold,
                     italic: cell.italic,
                     hidden: cell.hidden || (cell.blink && !self.blink_visible),
@@ -164,6 +165,11 @@ impl TextLayout {
                     bytes: begin..text.len(),
                     column: column as u16,
                     width: cell.width,
+                    foreground: if cell.selected {
+                        self.selection_foreground
+                    } else {
+                        cell.foreground
+                    },
                 });
             }
             if let Some(style) = style {
@@ -210,6 +216,18 @@ impl TextLayout {
             })
             .font_features(features);
         let buffer = &mut self.shaping_buffer;
+        let mut colors = Vec::new();
+        for cell in mapping {
+            if colors
+                .last()
+                .is_none_or(|(_, color)| *color != cell.foreground)
+            {
+                colors.push((
+                    f32::from(cell.column) * self.metrics.width as f32,
+                    cell.foreground,
+                ));
+            }
+        }
         buffer.set_wrap(Wrap::None);
         buffer.set_text(text, &attrs, Shaping::Advanced, None);
         buffer.shape_until_scroll(&mut self.font_system, false);
@@ -254,47 +272,93 @@ impl TextLayout {
                 if image.placement.width == 0 || image.placement.height == 0 {
                     continue;
                 }
-                let glyph_id = match self.glyph_ids.get(&physical.cache_key) {
-                    Some(glyph_id) => *glyph_id,
-                    None => {
-                        let glyph_id = u16::try_from(self.glyph_ids.len())
-                            .map_err(|_| "glyph atlas ID capacity exceeded".to_owned())?;
-                        self.glyph_ids.insert(physical.cache_key, glyph_id);
-                        self.images.insert(
-                            glyph_id,
-                            RasterizedCustomGlyph {
-                                data: image.data.clone(),
-                                content_type: match image.content {
-                                    SwashContent::Color => ContentType::Color,
-                                    SwashContent::Mask => ContentType::Mask,
-                                    SwashContent::SubpixelMask => {
-                                        return Err("subpixel glyph rasterization is unsupported"
-                                            .to_owned());
-                                    }
-                                },
+                let left = (physical.x + image.placement.left) as f32;
+                let mut color_index = colors
+                    .partition_point(|(start, _)| *start <= left)
+                    .saturating_sub(1);
+                let mut start = 0;
+                while start < image.placement.width {
+                    let end = if image.content == SwashContent::Color {
+                        image.placement.width
+                    } else {
+                        colors.get(color_index + 1).map_or(
+                            image.placement.width,
+                            |(boundary, _)| {
+                                (*boundary - left)
+                                    .round()
+                                    .clamp(0.0, image.placement.width as f32)
+                                    as u32
                             },
-                        );
-                        glyph_id
+                        )
+                    };
+                    if end > start {
+                        let key = GlyphRasterKey {
+                            cache_key: physical.cache_key,
+                            columns: [start, end],
+                        };
+                        let glyph_id =
+                            cache_glyph(&mut self.glyph_ids, &mut self.images, key, image)?;
+                        let foreground = colors[color_index].1;
+                        self.glyphs.push(CustomGlyph {
+                            id: glyph_id,
+                            left: left + start as f32,
+                            top: baseline.round() + physical.y as f32 - image.placement.top as f32,
+                            width: (end - start) as f32,
+                            height: image.placement.height as f32,
+                            color: Some(Color::rgb(
+                                foreground.red,
+                                foreground.green,
+                                foreground.blue,
+                            )),
+                            snap_to_physical_pixel: true,
+                            metadata: usize::from(row) * usize::from(u16::MAX)
+                                + usize::from(first.column),
+                        });
                     }
-                };
-                self.glyphs.push(CustomGlyph {
-                    id: glyph_id,
-                    left: (physical.x + image.placement.left) as f32,
-                    top: baseline.round() + physical.y as f32 - image.placement.top as f32,
-                    width: image.placement.width as f32,
-                    height: image.placement.height as f32,
-                    color: Some(Color::rgb(
-                        style.foreground.red,
-                        style.foreground.green,
-                        style.foreground.blue,
-                    )),
-                    snap_to_physical_pixel: true,
-                    metadata: usize::from(row) * usize::from(u16::MAX) + usize::from(first.column),
-                });
+                    start = end;
+                    color_index += 1;
+                }
             }
         }
         Ok(())
     }
+}
+
+fn cache_glyph(
+    glyph_ids: &mut HashMap<GlyphRasterKey, u16>,
+    images: &mut HashMap<u16, RasterizedCustomGlyph>,
+    key: GlyphRasterKey,
+    image: &SwashImage,
+) -> Result<u16, String> {
+    if let Some(id) = glyph_ids.get(&key) {
+        return Ok(*id);
+    }
+    let id = u16::try_from(glyph_ids.len())
+        .map_err(|_| "glyph atlas ID capacity exceeded".to_owned())?;
+    let (content_type, channels) = match image.content {
+        SwashContent::Mask => (ContentType::Mask, 1),
+        SwashContent::Color => (ContentType::Color, 4),
+        SwashContent::SubpixelMask => {
+            return Err("subpixel glyph rasterization is unsupported".to_owned());
+        }
+    };
+    let [start, end] = key.columns;
+    let data = if start == 0 && end == image.placement.width {
+        image.data.clone()
+    } else {
+        let mut cropped =
+            Vec::with_capacity((end - start) as usize * image.placement.height as usize * channels);
+        for row in image
+            .data
+            .chunks_exact(image.placement.width as usize * channels)
+        {
+            cropped.extend_from_slice(&row[start as usize * channels..end as usize * channels]);
+        }
+        cropped
+    };
+    images.insert(id, RasterizedCustomGlyph { data, content_type });
+    glyph_ids.insert(key, id);
+    Ok(id)
 }
 
 fn resolve_family(font_system: &mut FontSystem, requested: &str) -> Result<String, String> {
@@ -469,12 +533,12 @@ mod tests {
         let mut enabled_ids = enabled
             .glyph_ids
             .keys()
-            .map(|key| key.glyph_id)
+            .map(|key| key.cache_key.glyph_id)
             .collect::<Vec<_>>();
         let mut disabled_ids = disabled
             .glyph_ids
             .keys()
-            .map(|key| key.glyph_id)
+            .map(|key| key.cache_key.glyph_id)
             .collect::<Vec<_>>();
         enabled_ids.sort_unstable();
         disabled_ids.sort_unstable();
@@ -495,6 +559,64 @@ mod tests {
         assert!(
             (last.left - first.left - (text.len() - 1) as f32 * enabled.metrics.width as f32).abs()
                 < 0.001
+        );
+    }
+
+    #[test]
+    fn color_and_selection_boundaries_preserve_ligature_substitutions() {
+        let mut config = Config::default();
+        config.font.family = "FiraCode Nerd Font".to_owned();
+        let mut uniform = TextLayout::new(&config, 1.0).unwrap();
+        let mut colored = TextLayout::new(&config, 1.0).unwrap();
+        let mut selected = TextLayout::new(&config, 1.0).unwrap();
+        let mut frame = snapshot(&config, 20, &["~> -> != === <=> M"]);
+        uniform.shape(&frame).unwrap();
+        for (index, cell) in frame.cells.iter_mut().enumerate() {
+            if index % 2 == 0 {
+                cell.foreground = Rgb {
+                    red: 0,
+                    green: 255,
+                    blue: 0,
+                };
+            }
+        }
+        colored.shape(&frame).unwrap();
+        for cell in &mut frame.cells {
+            cell.foreground = config.colors.foreground.into();
+        }
+        frame.cells[0].selected = true;
+        selected.shape(&frame).unwrap();
+        let shaped_keys = |layout: &TextLayout| {
+            layout
+                .glyph_ids
+                .keys()
+                .map(|key| key.cache_key)
+                .collect::<std::collections::HashSet<_>>()
+        };
+        assert_eq!(shaped_keys(&uniform), shaped_keys(&colored));
+        assert_eq!(shaped_keys(&uniform), shaped_keys(&selected));
+        let entries = colored.glyph_ids.len();
+        for (index, cell) in frame.cells.iter_mut().enumerate() {
+            cell.foreground = if index % 2 == 0 {
+                Rgb {
+                    red: 255,
+                    green: 0,
+                    blue: 0,
+                }
+            } else {
+                Rgb {
+                    red: 0,
+                    green: 0,
+                    blue: 255,
+                }
+            };
+        }
+        frame.cells[0].selected = false;
+        colored.shape(&frame).unwrap();
+        assert_eq!(
+            colored.glyph_ids.len(),
+            entries,
+            "recoloring must reuse rasterized glyphs"
         );
     }
 
