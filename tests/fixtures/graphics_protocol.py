@@ -61,7 +61,82 @@ def stage(name, *data):
 
 
 def scenarios(scenario):
-    if scenario == "responses":
+    if scenario == "transport-matrix":
+        medium = sys.argv[2]
+        with tempfile.TemporaryDirectory(prefix="wisp-transport-matrix-") as temporary:
+            paths = []
+
+            def transmit(name, controls, data, sized=True):
+                if medium == "d":
+                    stage(name, command(controls + ",t=d", data))
+                    return
+                shared = medium == "s"
+                directory = Path("/dev/shm") if shared or medium == "t" else Path(temporary)
+                path = directory / ("tty-graphics-protocol-wisp-" + str(os.getpid()) + "-" + name)
+                paths.append(path)
+                path.write_bytes(b"prefix!" + data + bytes(128))
+                reference = ("/" if len(paths) % 2 else "") + path.name if shared else str(path)
+                size = ",S=" + str(len(data)) if sized else ""
+                stage(name, command(controls + ",t=" + medium + ",O=7" + size, os.fsencode(reference)))
+                assert path.exists() == (medium == "f"), (medium, name, "transport cleanup")
+
+            try:
+                for name, format, data, compression, sized in [
+                    ("rgba", 32, RED + GREEN, "", True),
+                    ("rgb", 24, RED[:3] + GREEN[:3], "", False),
+                    ("png", 100, png(2, 1, RED + GREEN), "", True),
+                    ("zlib", 32, zlib.compress(RED + GREEN), ",o=z", True),
+                    ("png-zlib", 100, zlib.compress(png(2, 1, RED + GREEN)), ",o=z", True),
+                ]:
+                    transmit("root-" + name, "a=T,i=151,p=1,f=" + str(format) + ",s=2,v=1,C=1" + compression, data, sized)
+                    transmit("frame-" + name, "a=f,i=151,f=" + str(format) + ",s=2,v=1" + compression, data, sized)
+                    stage("select-" + name, command("a=a,i=151,c=2"))
+                for format, data in [(8, bytes((0, 249))), (16, bytes((0, 128, 249, 255)))]:
+                    transmit("indexed-" + str(format), "a=T,i=152,p=1,f=" + str(format) + ",s=2,v=1,C=1", data)
+            finally:
+                for path in paths:
+                    path.unlink(missing_ok=True)
+    elif scenario == "transport-errors":
+        medium = sys.argv[2]
+        with tempfile.TemporaryDirectory(prefix="wisp-transport-errors-") as temporary:
+            directory = Path("/dev/shm") if medium == "s" else Path(temporary)
+            paths = []
+
+            def local_failure(name, suffix, data):
+                path = directory / ("tty-graphics-protocol-wisp-" + str(os.getpid()) + "-" + name)
+                paths.append(path)
+                if data is not None:
+                    path.write_bytes(data)
+                reference = path.name if medium == "s" else str(path)
+                stage(name, command("a=q,i=161,f=32,s=2,v=1,t=" + medium + suffix, os.fsencode(reference)))
+                assert path.exists() == (medium == "f" and data is not None), (medium, name, "error cleanup")
+
+            try:
+                local_failure("short", ",O=7", b"prefix!" + RED + GREEN[:3])
+                local_failure("offset", ",O=100,S=8", RED + GREEN)
+                local_failure("length", ",S=100", RED + GREEN)
+                local_failure("undersized", ",S=4", RED + GREEN)
+                local_failure("missing", "", None)
+                if medium != "s":
+                    fifo = directory / "tty-graphics-protocol-fifo"
+                    os.mkfifo(fifo)
+                    stage("special", command("a=q,i=161,f=32,s=2,v=1,t=" + medium, os.fsencode(fifo)))
+                    assert fifo.exists()
+                    target = directory / "tty-graphics-protocol-symlink-target"
+                    target.write_bytes(RED + GREEN)
+                    link = directory / "image-link.raw"
+                    link.symlink_to(target)
+                    stage("symlink", command("a=T,i=163,f=32,s=2,v=1,C=1,t=" + medium, os.fsencode(link)))
+                    assert target.exists() == (medium == "f")
+                if medium == "t":
+                    retained = directory / "ordinary-frame.raw"
+                    retained.write_bytes(RED + GREEN)
+                    stage("retained", command("a=T,i=162,f=32,s=2,v=1,C=1,t=t", os.fsencode(retained)))
+                    assert retained.exists()
+            finally:
+                for path in paths:
+                    path.unlink(missing_ok=True)
+    elif scenario == "responses":
         stage("query", command("a=q,i=11,f=24,s=1,v=1", bytes(3)))
         stage("quiet", command("a=t,i=12,f=32,s=1,v=1,q=1", RED),
               command("a=p,i=999,p=2,q=1"), command("a=p,i=998,q=2"))
@@ -208,6 +283,25 @@ def scenarios(scenario):
             "kitten", "icat", "--engine=builtin", "--stdin=no", "--align=left",
             "--transfer-mode=stream", "--detection-timeout=1", "--loop=-1", str(image),
         ], check=False)
+        title("graphics-stage:icat:" + str(result.returncode).encode().hex())
+    elif scenario == "icat-delta":
+        from PIL import Image, ImageDraw
+
+        directory = Path(sys.argv[2])
+        image = directory / "animated-delta.gif"
+        frames = []
+        for index in range(24):
+            frame = Image.new("RGB", (320, 180), (20, 30, 40))
+            ImageDraw.Draw(frame).rectangle((index * 10, 60, index * 10 + 25, 90), fill=(255, 80, 30))
+            frames.append(frame)
+        frames[0].save(image, save_all=True, append_images=frames[1:], duration=80, loop=0)
+        image = os.environ.get("WISP_TEST_ANIMATED_GIF", str(image))
+        if os.read(0, 1) != b"g":
+            raise SystemExit
+        arguments = ["kitten", "icat"]
+        if sys.argv[3] != "detect":
+            arguments.append("--transfer-mode=" + sys.argv[3])
+        result = subprocess.run([*arguments, image], check=False)
         title("graphics-stage:icat:" + str(result.returncode).encode().hex())
     else:
         raise ValueError(scenario)

@@ -1,12 +1,17 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::{CString, OsStr};
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
+use base64::engine::DecodePaddingMode;
+use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig, STANDARD};
 use libghostty_vt::kitty::graphics::Image;
 use libghostty_vt::screen::Screen;
 use libghostty_vt::style::PaletteIndex;
@@ -18,6 +23,10 @@ use crate::config::Config;
 
 const MAX_SEQUENCE_BYTES: usize = 96 * 1024 * 1024;
 const MAX_ANIMATION_BYTES: usize = 320 * 1024 * 1024;
+const PAYLOAD_BASE64: GeneralPurpose = GeneralPurpose::new(
+    &base64::alphabet::STANDARD,
+    GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+);
 
 pub(super) struct Protocol {
     filter: Filter,
@@ -184,7 +193,16 @@ impl Protocol {
             || fields_iter().any(|field| {
                 matches!(
                     field,
-                    b"a=f" | b"a=a" | b"a=c" | b"d=f" | b"d=F" | b"f=8" | b"f=16"
+                    b"a=f"
+                        | b"a=a"
+                        | b"a=c"
+                        | b"d=f"
+                        | b"d=F"
+                        | b"f=8"
+                        | b"f=16"
+                        | b"t=f"
+                        | b"t=t"
+                        | b"t=s"
                 ) || field.starts_with(b"e=")
             });
         if !extended {
@@ -206,6 +224,33 @@ impl Protocol {
             feature_query(&fields, reply);
             return;
         }
+        if matches!(action, b't' | b'T' | b'q')
+            && matches!(fields.character(b't', b'd'), b'f' | b't' | b's')
+            && !matches!(fields.number(b'f'), Ok(8 | 16))
+        {
+            let result = (|| {
+                let payload = PAYLOAD_BASE64.decode(payload).map_err(|_| "EINVAL")?;
+                if action == b'q' {
+                    decode_image(&fields, payload)?;
+                    respond(&fields, None, None, "OK", reply);
+                } else {
+                    let data = decode_transport(&fields, payload)?;
+                    if data.is_empty() {
+                        return Err("EINVAL");
+                    }
+                    let mut direct = fields.clone();
+                    for key in b"tSOom" {
+                        direct.0.remove(key);
+                    }
+                    upload_data(terminal, &direct, &data);
+                }
+                Ok::<_, &'static str>(())
+            })();
+            if let Err(error) = result {
+                respond(&fields, None, None, error, reply);
+            }
+            return;
+        }
         if action == b'd' {
             self.pending = None;
             if matches!(fields.character(b'd', b'a'), b'f' | b'F') {
@@ -224,7 +269,7 @@ impl Protocol {
                 })
         });
         if action == b'f' || indexed || continuation {
-            let payload = match STANDARD.decode(payload) {
+            let payload = match PAYLOAD_BASE64.decode(payload) {
                 Ok(payload) => payload,
                 Err(_) => {
                     let mut failed = self
@@ -527,7 +572,7 @@ impl Protocol {
             upload.set(b'i', self.next_id);
             upload.set(b'q', 2);
         }
-        upload_rgba(terminal, &upload, &rgba);
+        upload_data(terminal, &upload, &rgba);
         let image_id = self.identify(terminal, &upload)?;
         let graphics = terminal.kitty_graphics().map_err(|_| "EINVAL")?;
         let image = graphics.image(image_id).ok_or("EINVAL")?;
@@ -706,6 +751,8 @@ fn respond(
     }
     if let Some(frame) = frame {
         response.push_str(&format!(",r={frame}"));
+    } else if fields.number(b'p').unwrap_or(0) != 0 {
+        response.push_str(&format!(",p={}", fields.number(b'p').unwrap()));
     }
     let message = if code == "EBADF" {
         "EBADF:Failed to read image file"
@@ -836,36 +883,75 @@ fn decode_transport(fields: &Fields, payload: Vec<u8>) -> Result<Vec<u8>, &'stat
     let data = match medium {
         b'd' => payload,
         b'f' | b't' | b's' => {
-            let text = std::str::from_utf8(&payload).map_err(|_| "EBADF")?;
-            if text.contains('\0') {
+            if payload.contains(&0) {
                 return Err("EBADF");
             }
-            let path = if medium == b's' {
-                let name = text.strip_prefix('/').unwrap_or(text);
-                if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+            let path = PathBuf::from(OsStr::from_bytes(&payload));
+            let mut remove_temporary = None;
+            let mut file = if medium == b's' {
+                let name = CString::new(payload).map_err(|_| "EBADF")?;
+                let descriptor = unsafe {
+                    libc::shm_open(
+                        name.as_ptr(),
+                        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                        0,
+                    )
+                };
+                if descriptor < 0 {
                     return Err("EBADF");
                 }
-                PathBuf::from("/dev/shm").join(name)
+                let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+                unsafe {
+                    libc::shm_unlink(name.as_ptr());
+                }
+                File::from(descriptor)
             } else {
-                PathBuf::from(text)
-            };
-            let read = || -> Result<Vec<u8>, &'static str> {
                 let resolved = path.canonicalize().map_err(|_| "EBADF")?;
-                if medium != b's'
-                    && ["/proc", "/sys", "/dev"]
-                        .iter()
-                        .any(|prefix| resolved.starts_with(prefix))
+                if ["/proc", "/sys", "/dev"]
+                    .iter()
+                    .any(|prefix| resolved.starts_with(prefix))
+                    && !resolved.starts_with("/dev/shm")
                 {
                     return Err("EBADF");
                 }
                 if !fs::metadata(&resolved).map_err(|_| "EBADF")?.is_file() {
                     return Err("EBADF");
                 }
-                let mut file = File::open(resolved).map_err(|_| "EBADF")?;
+                let file = File::options()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&resolved)
+                    .map_err(|_| "EBADF")?;
+                let temporary = medium == b't'
+                    && resolved
+                        .as_os_str()
+                        .as_bytes()
+                        .windows(b"tty-graphics-protocol".len())
+                        .any(|part| part == b"tty-graphics-protocol")
+                    && [
+                        PathBuf::from("/tmp"),
+                        PathBuf::from("/dev/shm"),
+                        std::env::temp_dir(),
+                    ]
+                    .iter()
+                    .any(|directory| {
+                        directory
+                            .canonicalize()
+                            .is_ok_and(|directory| resolved.starts_with(directory))
+                    });
+                if temporary {
+                    remove_temporary = Some(resolved);
+                }
+                file
+            };
+            let read = || -> Result<Vec<u8>, &'static str> {
+                if !file.metadata().map_err(|_| "EBADF")?.is_file() {
+                    return Err("EBADF");
+                }
                 file.seek(SeekFrom::Start(u64::from(fields.number(b'O')?)))
                     .map_err(|_| "EBADF")?;
                 let mut size = fields.number(b'S')? as usize;
-                if size == 0 && fields.character(b'o', 0) == 0 {
+                if fields.character(b'o', 0) == 0 {
                     let channels = match fields.number(b'f')? {
                         0 | 32 => Some(4),
                         24 => Some(3),
@@ -874,8 +960,13 @@ fn decode_transport(fields: &Fields, payload: Vec<u8>) -> Result<Vec<u8>, &'stat
                         _ => None,
                     };
                     if let Some(channels) = channels {
-                        size =
+                        let expected =
                             checked_length(fields.number(b's')?, fields.number(b'v')?, channels)?;
+                        if size == 0 {
+                            size = expected;
+                        } else if size < expected {
+                            return Err("EBADF");
+                        }
                     }
                 }
                 if size > MAX_SEQUENCE_BYTES {
@@ -895,17 +986,8 @@ fn decode_transport(fields: &Fields, payload: Vec<u8>) -> Result<Vec<u8>, &'stat
                 Ok(data)
             };
             let result = read();
-            let temporary = medium == b't'
-                && path.to_string_lossy().contains("tty-graphics-protocol")
-                && [
-                    PathBuf::from("/tmp"),
-                    PathBuf::from("/dev/shm"),
-                    std::env::temp_dir(),
-                ]
-                .iter()
-                .any(|directory| path.starts_with(directory));
-            if medium == b's' || temporary {
-                let _ = fs::remove_file(&path);
+            if let Some(temporary) = remove_temporary {
+                let _ = fs::remove_file(temporary);
             }
             result?
         }
@@ -978,8 +1060,8 @@ fn expand_indices(indices: &[u8], channels: usize, palette: &[[u8; 4]]) -> Vec<u
     rgba
 }
 
-fn upload_rgba(terminal: &mut Terminal<'_, '_>, fields: &Fields, rgba: &[u8]) {
-    let chunks = rgba.chunks(3072);
+fn upload_data(terminal: &mut Terminal<'_, '_>, fields: &Fields, data: &[u8]) {
+    let chunks = data.chunks(3072);
     let count = chunks.len();
     for (index, chunk) in chunks.enumerate() {
         let mut controls = if index == 0 {

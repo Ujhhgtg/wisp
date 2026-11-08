@@ -11,6 +11,7 @@ base64 = "0.22"
 flate2 = "1.1"
 glyphon = "0.12"
 libghostty-vt = { version = "0.2.2", features = ["kitty-graphics", "png"] }
+libc = "0.2"
 memchr = "2.8"
 portable-pty = "0.9"
 pollster = "0.4"

@@ -296,6 +296,58 @@ fn image_file_failures_have_identical_responses_and_special_files_never_block() 
 }
 
 #[test]
+fn all_four_transports_preserve_offsets_formats_frames_and_cleanup() {
+    for medium in ["d", "f", "t", "s"] {
+        let probe = Probe::with_arguments("transport-matrix", &[medium.as_ref()]);
+        for format in ["rgba", "rgb", "png", "zlib", "png-zlib"] {
+            let replies = probe.step(&format!("root-{format}"));
+            assert_eq!(replies.len(), 1, "{medium}/{format}: {replies:?}");
+            assert_reply(&replies[0], "OK", 151);
+            probe.pixels(151, &[RED, GREEN].concat());
+            let replies = probe.step(&format!("frame-{format}"));
+            assert_eq!(replies.len(), 1, "{medium}/{format}: {replies:?}");
+            assert_reply(&replies[0], "OK", 151);
+            assert!(probe.step(&format!("select-{format}")).is_empty());
+            probe.pixels(151, &[RED, GREEN].concat());
+        }
+        for format in [8, 16] {
+            let replies = probe.step(&format!("indexed-{format}"));
+            assert_eq!(replies.len(), 1, "{medium}/{format}: {replies:?}");
+            assert_reply(&replies[0], "OK", 152);
+            probe.frame(|frame| {
+                frame.graphics.placements.iter().any(|placement| {
+                    placement.image_id == 152
+                        && placement.image.rgba.len() == 8
+                        && placement.image.rgba[3] == if format == 8 { 255 } else { 128 }
+                })
+            });
+        }
+    }
+}
+
+#[test]
+fn local_transports_reject_short_or_out_of_bounds_reads_and_only_unlink_owned_resources() {
+    for medium in ["f", "t", "s"] {
+        let probe = Probe::with_arguments("transport-errors", &[medium.as_ref()]);
+        for stage in ["short", "offset", "length", "undersized", "missing"] {
+            let replies = probe.step(stage);
+            assert_eq!(replies.len(), 1, "{medium}/{stage}: {replies:?}");
+            assert_reply(&replies[0], "EBADF", 161);
+            assert_eq!(replies[0].message, "EBADF:Failed to read image file");
+        }
+        if medium != "s" {
+            assert_reply(&probe.step("special")[0], "EBADF", 161);
+            assert_reply(&probe.step("symlink")[0], "OK", 163);
+            probe.pixels(163, &[RED, GREEN].concat());
+        }
+        if medium == "t" {
+            assert_reply(&probe.step("retained")[0], "OK", 162);
+            probe.pixels(162, &[RED, GREEN].concat());
+        }
+    }
+}
+
+#[test]
 fn animation_frame_patches_composition_and_deletion_preserve_exact_pixels() {
     let probe = Probe::new("animation");
     assert_reply(&probe.step("root")[0], "OK", 61);
@@ -470,8 +522,7 @@ fn animation_state_is_isolated_between_screens_and_cleared_by_reset() {
     probe.frame(|frame| frame.graphics.placements.is_empty());
 }
 
-#[test]
-fn actual_kitten_icat_gif_animates_after_the_client_exits() {
+fn icat_dependencies_available() -> bool {
     let kitten = std::process::Command::new("kitten")
         .arg("--version")
         .output();
@@ -482,6 +533,14 @@ fn actual_kitten_icat_gif_animates_after_the_client_exits() {
         || !pillow.is_ok_and(|status| status.success())
     {
         eprintln!("kitten or Pillow unavailable; skipping real GIF integration");
+        return false;
+    }
+    true
+}
+
+#[test]
+fn actual_kitten_icat_gif_animates_after_the_client_exits() {
+    if !icat_dependencies_available() {
         return;
     }
     let directory = std::env::temp_dir().join(format!("wisp-animated-icat-{}", std::process::id()));
@@ -509,5 +568,43 @@ fn actual_kitten_icat_gif_animates_after_the_client_exits() {
         "icat produced only these frame colors: {colors:?}"
     );
     drop(probe);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn kitten_icat_animates_large_delta_frames_with_every_transfer_mode() {
+    use std::hash::{Hash, Hasher};
+
+    if !icat_dependencies_available() {
+        return;
+    }
+    let directory = std::env::temp_dir().join(format!("wisp-delta-icat-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    for mode in ["detect", "stream", "file", "memory"] {
+        let probe = Probe::with_arguments("icat-delta", &[directory.as_os_str(), mode.as_ref()]);
+        probe.session.send(Command::Input(b"g".to_vec()));
+        assert_eq!(
+            probe.wait_title("graphics-stage:icat:"),
+            "graphics-stage:icat:30"
+        );
+        let mut frames = HashSet::new();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && frames.len() < 4 {
+            if let Some(frame) = probe.session.try_snapshot() {
+                for placement in frame.graphics.placements.iter() {
+                    let mut hash = std::collections::hash_map::DefaultHasher::new();
+                    placement.image.rgba.hash(&mut hash);
+                    frames.insert(hash.finish());
+                }
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            frames.len() >= 4,
+            "icat {mode} produced only {} distinct frames",
+            frames.len()
+        );
+        drop(probe);
+    }
     std::fs::remove_dir_all(directory).unwrap();
 }

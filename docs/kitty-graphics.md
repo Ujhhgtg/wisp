@@ -96,6 +96,39 @@ commands. It invokes installed `kitten icat` for a real animated GIF.
 tests cover frame timing, composition, dependencies, quotas, stream boundaries,
 and GPU upload reuse/eviction.
 
+The delta-frame GIF regression invokes plain `kitten icat` as well as explicit
+stream, file, and shared-memory transfers. It generates a 320×180 moving-object
+GIF by default. To repeat it with a particular GIF and verify actual window
+pixels after the client exits:
+
+```sh
+WISP_TEST_ANIMATED_GIF=/path/to/animation.gif cargo test --test kitty_protocol kitten_icat_animates_large
+python3 tests/gui_icat_animation.py /path/to/animation.gif
+```
+
+Local transport names may use base64 without padding. Frame uploads accept both
+padded and unpadded payloads, including Kitty's temporary files in `/dev/shm`;
+regular-file checks and blocking of other sensitive device paths still apply.
+
+All local transports use the same bounded reader for normal images, animation
+frames, and indexed images. File offsets are relative to the start of the
+resource and sizes describe the requested byte range, including for compressed
+data. Shared-memory names are passed to POSIX `shm_open` unchanged, with or
+without a leading slash; the object is closed and unlinked after opening.
+Ordinary files are retained. Temporary files are unlinked only when their
+resolved path is in a known temporary directory and contains
+`tty-graphics-protocol`; other regular files can be read but are retained.
+FIFOs, devices, short reads, and out-of-bounds ranges report uniform file errors.
+
+The transport matrix covers `d`, `f`, `t`, and `s` across RGB/RGBA, PNG, zlib,
+PNG plus zlib, frame updates, and indexed pixels. It verifies exact pixels,
+nonzero offsets, requested lengths, leading-slash variants, and resource cleanup:
+
+```sh
+cargo test --test kitty_protocol all_four_transports
+cargo test --test kitty_protocol local_transports
+```
+
 The Hyprland GUI test captures changing red/green/blue animation frames, a
 Unicode image, and an image positioned relative to a virtual parent. It requires
 `grim`, Python Pillow, and the same compositor helpers as `gui_smoke.py`.

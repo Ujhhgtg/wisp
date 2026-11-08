@@ -3029,6 +3029,7 @@ dependencies = [
  "bytemuck",
  "flate2",
  "glyphon",
+ "libc",
  "libghostty-vt",
  "memchr",
  "png",
