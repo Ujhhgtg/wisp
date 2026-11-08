@@ -242,7 +242,7 @@ impl Protocol {
                     for key in b"tSOom" {
                         direct.0.remove(key);
                     }
-                    upload_data(terminal, &direct, &data);
+                    upload_data(&direct, &data, |packet| terminal.vt_write(packet));
                 }
                 Ok::<_, &'static str>(())
             })();
@@ -572,7 +572,7 @@ impl Protocol {
             upload.set(b'i', self.next_id);
             upload.set(b'q', 2);
         }
-        upload_data(terminal, &upload, &rgba);
+        upload_data(&upload, &rgba, |packet| terminal.vt_write(packet));
         let image_id = self.identify(terminal, &upload)?;
         let graphics = terminal.kitty_graphics().map_err(|_| "EINVAL")?;
         let image = graphics.image(image_id).ok_or("EINVAL")?;
@@ -1060,17 +1060,31 @@ fn expand_indices(indices: &[u8], channels: usize, palette: &[[u8; 4]]) -> Vec<u
     rgba
 }
 
-fn upload_data(terminal: &mut Terminal<'_, '_>, fields: &Fields, data: &[u8]) {
+fn upload_data(fields: &Fields, data: &[u8], mut emit: impl FnMut(&[u8])) {
     let chunks = data.chunks(3072);
     let count = chunks.len();
+    if count == 0 {
+        return;
+    }
+    let mut controls = fields.clone();
+    controls.set(b'm', u8::from(count > 1));
+    let mut header = controls.packet(&[]);
+    header.truncate(header.len() - 2);
+    let mut packet = Vec::with_capacity(header.len() + 4098);
     for (index, chunk) in chunks.enumerate() {
-        let mut controls = if index == 0 {
-            fields.clone()
+        packet.clear();
+        packet.extend_from_slice(if index == 0 {
+            &header
+        } else if index + 1 < count {
+            b"\x1b_Gm=1;"
         } else {
-            Fields::default()
-        };
-        controls.set(b'm', u8::from(index + 1 < count));
-        terminal.vt_write(&controls.packet(STANDARD.encode(chunk).as_bytes()));
+            b"\x1b_Gm=0;"
+        });
+        let start = packet.len();
+        packet.resize(start + chunk.len().div_ceil(3) * 4, 0);
+        STANDARD.encode_slice(chunk, &mut packet[start..]).unwrap();
+        packet.extend_from_slice(b"\x1b\\");
+        emit(&packet);
     }
 }
 
@@ -1363,6 +1377,39 @@ mod tests {
             replies.extend_from_slice(reply)
         });
         replies
+    }
+
+    #[test]
+    fn upload_packets_preserve_chunk_limits_controls_and_exact_payload() {
+        let fields = Fields::parse(b"a=T,i=29,p=7,f=32,s=1024,v=16,q=2,m=99").unwrap();
+        for length in [0_usize, 1, 2, 3, 3071, 3072, 3073, 6143, 6144, 6145, 65537] {
+            let data = (0..length)
+                .map(|index| index.wrapping_mul(37) as u8)
+                .collect::<Vec<_>>();
+            let mut packets = Vec::new();
+            upload_data(&fields, &data, |packet| packets.push(packet.to_vec()));
+            assert_eq!(packets.len(), length.div_ceil(3072));
+            let mut decoded = Vec::new();
+            for (index, packet) in packets.iter().enumerate() {
+                assert!(packet.starts_with(b"\x1b_G"));
+                assert!(packet.ends_with(b"\x1b\\"));
+                let (controls, payload) = packet[3..packet.len() - 2].split_once_byte(b';');
+                let parsed = Fields::parse(controls).unwrap();
+                let mut expected = if index == 0 {
+                    fields.clone()
+                } else {
+                    Fields::default()
+                };
+                expected.set(b'm', u8::from(index + 1 < packets.len()));
+                assert_eq!(parsed.0, expected.0);
+                assert!(payload.len() <= 4096);
+                if index + 1 < packets.len() {
+                    assert_eq!(payload.len(), 4096);
+                }
+                decoded.extend(STANDARD.decode(payload).unwrap());
+            }
+            assert_eq!(decoded, data);
+        }
     }
 
     #[test]
