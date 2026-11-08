@@ -265,6 +265,68 @@ fn kitty_negotiation_preserves_control_disambiguation_and_extended_function_iden
 }
 
 #[test]
+fn non_latin_control_aliases_follow_physical_keys_without_overriding_latin_remaps() {
+    let mut terminal = terminal();
+    let mut state = InputState::new().unwrap();
+    let encode = |state: &mut InputState,
+                  terminal: &mut Terminal<'static, 'static>,
+                  physical,
+                  text: &str,
+                  mods| {
+        state
+            .key(
+                terminal,
+                &Config::default(),
+                physical,
+                mods,
+                key::Action::Press,
+                Some(text.to_owned()),
+                text.chars().next(),
+            )
+            .unwrap()
+            .bytes
+    };
+    for (physical, text, plain, alt) in [
+        (key::Key::I, "ш", b"\t".as_slice(), b"\x1b\t".as_slice()),
+        (key::Key::M, "ь", b"\r", b"\x1b\r"),
+        (key::Key::BracketLeft, "х", b"\x1b", b"\x1b\x1b"),
+    ] {
+        assert_eq!(
+            encode(&mut state, &mut terminal, physical, text, key::Mods::CTRL),
+            plain
+        );
+        assert_eq!(
+            encode(
+                &mut state,
+                &mut terminal,
+                physical,
+                text,
+                key::Mods::CTRL | key::Mods::ALT
+            ),
+            alt
+        );
+    }
+    assert_eq!(
+        encode(&mut state, &mut terminal, key::Key::I, "c", key::Mods::CTRL),
+        b"\x03"
+    );
+    assert_eq!(
+        encode(&mut state, &mut terminal, key::Key::C, "i", key::Mods::CTRL),
+        b"\t"
+    );
+    terminal.vt_write(b"\x1b[>4;2m");
+    assert_eq!(
+        encode(&mut state, &mut terminal, key::Key::I, "ш", key::Mods::CTRL),
+        b"\x1b[27;5;1096~"
+    );
+    terminal.vt_write(b"\x1b[>4;0m\x1b[>1u");
+    assert_eq!(
+        encode(&mut state, &mut terminal, key::Key::I, "ш", key::Mods::CTRL),
+        b"\x1b[1096;5u"
+    );
+}
+
+#[test]
 fn numlock_off_keypad_navigation_uses_logical_keys_in_legacy_and_kitty_modes() {
     use winit::keyboard::{Key, KeyCode, NamedKey};
     let mut terminal = terminal();

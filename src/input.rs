@@ -146,6 +146,15 @@ impl InputState {
         let unshifted = unshifted
             .or_else(|| text.as_ref()?.chars().next()?.to_lowercase().next())
             .or_else(|| physical_codepoint(key));
+        let physical_alias = text
+            .as_ref()
+            .filter(|text| !text.is_ascii())
+            .and(match key {
+                key::Key::I => Some(b'\t'),
+                key::Key::M => Some(b'\r'),
+                key::Key::BracketLeft => Some(0x1b),
+                _ => None,
+            });
         event.set_utf8(text);
         if let Some(unshifted) = unshifted {
             event.set_unshifted_codepoint(unshifted);
@@ -153,7 +162,7 @@ impl InputState {
         let mut result = InputResult::default();
         self.key_encoder.encode_to_vec(&event, &mut result.bytes)?;
         if legacy {
-            if let Some(alias) = legacy_control_alias(&result.bytes) {
+            if let Some(alias) = legacy_control_alias(&result.bytes, physical_alias) {
                 result.bytes.clear();
                 result.bytes.extend_from_slice(alias);
             } else if encoded_key == key::Key::F3
@@ -896,7 +905,7 @@ pub fn map_numpad_key(
     })
 }
 
-fn legacy_control_alias(encoded: &[u8]) -> Option<&'static [u8]> {
+fn legacy_control_alias(encoded: &[u8], physical_alias: Option<u8>) -> Option<&'static [u8]> {
     match encoded {
         b"\x1b[105;5u" => Some(b"\t"),
         b"\x1b[109;5u" => Some(b"\r"),
@@ -904,6 +913,18 @@ fn legacy_control_alias(encoded: &[u8]) -> Option<&'static [u8]> {
         b"\x1b[105;7u" => Some(b"\x1b\t"),
         b"\x1b[109;7u" => Some(b"\x1b\r"),
         b"\x1b[91;7u" => Some(b"\x1b\x1b"),
+        _ if encoded.starts_with(b"\x1b[") && encoded.ends_with(b";5u") => match physical_alias {
+            Some(b'\t') => Some(b"\t"),
+            Some(b'\r') => Some(b"\r"),
+            Some(0x1b) => Some(b"\x1b"),
+            _ => None,
+        },
+        _ if encoded.starts_with(b"\x1b[") && encoded.ends_with(b";7u") => match physical_alias {
+            Some(b'\t') => Some(b"\x1b\t"),
+            Some(b'\r') => Some(b"\x1b\r"),
+            Some(0x1b) => Some(b"\x1b\x1b"),
+            _ => None,
+        },
         _ => None,
     }
 }
