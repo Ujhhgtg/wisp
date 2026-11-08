@@ -739,7 +739,8 @@ impl Renderer {
             .map_or(self.config.colors.foreground.into(), |snapshot| {
                 snapshot.foreground
             });
-        self.preedit_renderer.prepare(
+        let images = &self.layout.images;
+        self.preedit_renderer.prepare_with_custom(
             &self.device,
             &self.queue,
             &mut self.layout.font_system,
@@ -760,6 +761,7 @@ impl Renderer {
                 custom_glyphs: &[],
             }],
             &mut self.layout.swash_cache,
+            |request| images.get(&request.id).cloned(),
         )?;
         Ok(true)
     }
@@ -1568,6 +1570,35 @@ mod tests {
         renderer.set_preedit(String::new());
         assert_eq!(capture(&mut renderer), before);
         assert!(renderer.next_frame_deadline().is_none());
+    }
+
+    #[test]
+    fn ime_preedit_can_grow_an_atlas_containing_terminal_glyphs() {
+        let config = Config::default();
+        let mut renderer = offscreen(config.clone());
+        renderer.set_snapshot(snapshot(&config, 12, 3));
+        renderer.layout.images.insert(
+            u16::MAX,
+            glyphon::RasterizedCustomGlyph {
+                data: vec![255; 240 * 240],
+                content_type: glyphon::ContentType::Mask,
+            },
+        );
+        renderer.layout.glyphs = vec![glyphon::CustomGlyph {
+            id: u16::MAX,
+            width: 240.0,
+            height: 240.0,
+            snap_to_physical_pixel: true,
+            ..Default::default()
+        }];
+        renderer.set_preedit("W".to_owned());
+        renderer
+            .preedit_buffer
+            .set_metrics(Metrics::new(200.0, 250.0));
+        renderer
+            .preedit_buffer
+            .shape_until_scroll(&mut renderer.layout.font_system, false);
+        capture(&mut renderer);
     }
 
     #[test]
