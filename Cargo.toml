@@ -23,3 +23,6 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
 [patch.crates-io]
 libghostty-vt-sys = { path = "vendor/libghostty-vt-sys" }
+
+[profile.release]
+panic = "abort"
