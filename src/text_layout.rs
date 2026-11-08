@@ -135,6 +135,23 @@ impl TextLayout {
                     .extend_from_slice(&self.rows[usize::from(row)].glyphs);
                 continue;
             }
+            let cache = &mut self.rows[usize::from(row)];
+            if cache.cells.len() == cells.len()
+                && cache.cells.iter().zip(cells).all(|(previous, current)| {
+                    previous.text == current.text
+                        && previous.width == current.width
+                        && previous.foreground == current.foreground
+                        && previous.bold == current.bold
+                        && previous.italic == current.italic
+                        && previous.blink == current.blink
+                        && previous.hidden == current.hidden
+                        && previous.selected == current.selected
+                })
+            {
+                cache.cells.clone_from_slice(cells);
+                self.glyphs.extend_from_slice(&cache.glyphs);
+                continue;
+            }
             self.shaped_rows += 1;
             let glyph_start = self.glyphs.len();
             let mut text = String::new();
@@ -642,6 +659,51 @@ mod tests {
         assert_eq!(layout.revision, revision);
         assert_eq!(layout.glyph_ids.len(), atlas_entries);
         assert_eq!(layout.glyphs, glyphs);
+    }
+
+    #[test]
+    fn background_and_decoration_changes_reuse_shaping_and_keep_cached_attributes_current() {
+        let config = Config::default();
+        let mut layout = TextLayout::new(&config, 1.0).unwrap();
+        let mut frame = snapshot(&config, 16, &["alpha", "beta", "gamma"]);
+        layout.shape(&frame).unwrap();
+        let revision = layout.revision;
+        let glyphs = layout.glyphs.clone();
+        let atlas_entries = layout.glyph_ids.len();
+        let cell = &mut frame.cells[0];
+        cell.background = Some(Rgb {
+            red: 10,
+            green: 20,
+            blue: 30,
+        });
+        cell.underline = true;
+        cell.underline_style = crate::terminal::UnderlineStyle::Curly;
+        cell.underline_color = Some(Rgb {
+            red: 40,
+            green: 50,
+            blue: 60,
+        });
+        cell.strikethrough = true;
+        cell.overline = true;
+        layout.shape(&frame).unwrap();
+        assert_eq!(layout.shaped_rows, 0);
+        assert_eq!(layout.revision, revision);
+        assert_eq!(layout.glyph_ids.len(), atlas_entries);
+        assert_eq!(layout.glyphs, glyphs);
+        assert_eq!(layout.rows[0].cells, frame.cells[..16]);
+        frame.cells[0].foreground = Rgb {
+            red: 255,
+            green: 0,
+            blue: 0,
+        };
+        layout.shape(&frame).unwrap();
+        assert_eq!(layout.shaped_rows, 1);
+        assert_ne!(layout.glyphs, glyphs);
+        frame.cells[0].blink = true;
+        layout.shape(&frame).unwrap();
+        assert!(layout.set_blink_visible(false));
+        layout.shape(&frame).unwrap();
+        assert_eq!(layout.shaped_rows, 1);
     }
 
     #[test]

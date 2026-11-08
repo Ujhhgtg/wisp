@@ -15,6 +15,9 @@ new raster data. Intrinsically colored emoji retain their original pixels.
 
 Cursor-only frames and unchanged text rows keep their existing caches. Disabling
 ligatures still disables the configured OpenType ligature/contextual features.
+Background and decoration changes also reuse shaped glyphs while retaining the
+current cell attributes for subsequent blink and text updates. IME preedit uses
+the same custom-glyph rasterizer when its shared atlas grows.
 
 Validation uses actual FiraCode font substitutions and GPU pixel readback. It
 compares uniform and multicolor `~>`, arrows, inequality signs, and longer
@@ -24,3 +27,13 @@ color. Selection boundaries are included.
 ```sh
 cargo test --lib ligature
 ```
+
+CPU shaping and cache behavior can be measured with the configured font:
+
+```sh
+cargo run --release --example text_throughput -- 300
+```
+
+The example reports cursor-only frames, background updates, uniform and
+alternating-color text updates, and one-row edits on a 160×48 grid. It includes
+snapshot mutations and excludes PTY processing, GPU work, and presentation.
