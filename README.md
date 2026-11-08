@@ -45,6 +45,20 @@ to launch another program or an explicit config:
 cargo run --release -- --config /path/to/config.toml -e /bin/bash
 ```
 
+`[window] confirm_on_close = true` (the default) asks before closing when the
+default shell has a running foreground/background or stopped job, or a program
+launched with `-e` is still running. An idle default shell closes immediately.
+Replacing the default shell with `exec` also asks before closing. Set it to
+`false` to always close without asking.
+
+The confirmation fills the window and supports mouse clicks, `Y`/`N`,
+`Tab`/arrow keys, `Enter`, and `Esc`. “Keep open” is selected initially.
+It uses English, Simplified Chinese, or Traditional Chinese according to
+`LC_ALL`, then `LC_MESSAGES`, then `LANG`; unsupported locales use English.
+Chinese script subtags are respected, with CN/SG selecting Simplified and
+TW/HK/MO selecting Traditional when no script is specified. Job inspection
+runs only on close; it does not poll while the terminal is idle or parsing.
+
 ## validation
 
 ```sh
@@ -52,4 +66,5 @@ cargo test --all-targets
 cargo build --release
 cargo build --example keyboard_driver --example pointer_driver
 python3 tests/gui_smoke.py
+python3 tests/gui_close_confirmation.py
 ```

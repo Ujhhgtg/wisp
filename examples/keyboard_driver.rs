@@ -64,7 +64,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         "copy" => (5, 46),
         "paste" => (5, 47),
         "eof" => (4, 32),
-        _ => return Err("usage: keyboard_driver copy|paste|eof".into()),
+        "enter" => (0, 28),
+        "escape" => (0, 1),
+        "tab" => (0, 15),
+        "left" => (0, 105),
+        "right" => (0, 106),
+        _ => {
+            return Err("usage: keyboard_driver copy|paste|eof|enter|escape|tab|left|right".into());
+        }
     };
     let output = Command::new("xkbcli")
         .args(["compile-keymap", "--format", "1", "--layout", "us"])

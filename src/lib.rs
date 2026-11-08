@@ -1,3 +1,4 @@
+pub mod close_confirmation;
 pub mod config;
 pub mod cursor;
 pub mod diagnostics;

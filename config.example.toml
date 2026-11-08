@@ -7,6 +7,7 @@ ligatures = true
 
 [window]
 margin_width = 21.75
+confirm_on_close = true
 
 [colors]
 background = "#000000"

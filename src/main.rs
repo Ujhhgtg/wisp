@@ -13,6 +13,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, KeyCode, ModifiersState, PhysicalKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{CursorIcon, Window, WindowId};
+use wisp::close_confirmation::{Choice, CloseDialog, Language};
 use wisp::{config, renderer, terminal};
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -61,6 +62,7 @@ struct WispApp {
     pointer_inside: bool,
     consumed_keys: HashSet<KeyCode>,
     default_font_size: f32,
+    close_dialog: Option<CloseDialog>,
 }
 
 impl WispApp {
@@ -89,6 +91,7 @@ impl WispApp {
             pointer_inside: false,
             consumed_keys: HashSet::new(),
             default_font_size,
+            close_dialog: None,
         }
     }
 
@@ -109,6 +112,133 @@ impl WispApp {
         if let Some(session) = self.session.as_ref() {
             session.send(command);
         }
+    }
+
+    fn request_close(&mut self, event_loop: &ActiveEventLoop) {
+        if self.close_dialog.is_some() {
+            return;
+        }
+        let needs_confirmation = self.config.window.confirm_on_close
+            && self.session.as_ref().is_some_and(|session| {
+                session.needs_close_confirmation().unwrap_or_else(|error| {
+                    eprintln!("failed to inspect terminal jobs: {error}");
+                    true
+                })
+            });
+        if !needs_confirmation {
+            event_loop.exit();
+            return;
+        }
+        self.close_dialog = Some(CloseDialog::new(Language::system()));
+        wisp::diagnostics::trace("close-dialog-open");
+        self.ime_composing = false;
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_preedit(String::new());
+        }
+        if let Some(window) = &self.window {
+            window.set_ime_allowed(false);
+            window.set_cursor_visible(true);
+            window.set_cursor(CursorIcon::Default);
+        }
+        self.refresh_close_dialog();
+    }
+
+    fn refresh_close_dialog(&mut self) {
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_close_confirmation(self.close_dialog.clone());
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn choose_close_dialog(&mut self, choice: Choice, event_loop: &ActiveEventLoop) {
+        if choice == Choice::Close {
+            event_loop.exit();
+        } else {
+            self.close_dialog = None;
+            wisp::diagnostics::trace("close-dialog-cancelled");
+            if let Some(window) = &self.window {
+                window.set_ime_allowed(true);
+                window.set_cursor(self.pointer);
+            }
+            self.refresh_close_dialog();
+        }
+    }
+
+    fn close_dialog_event(&mut self, event: &WindowEvent, event_loop: &ActiveEventLoop) -> bool {
+        if self.close_dialog.is_none() {
+            return false;
+        }
+        let mut choice = None;
+        match event {
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    if event.state == ElementState::Released {
+                        self.consumed_keys.remove(&code);
+                    } else {
+                        self.consumed_keys.insert(code);
+                    }
+                }
+                if event.state == ElementState::Pressed
+                    && !event.repeat
+                    && !self.modifiers.control_key()
+                    && !self.modifiers.alt_key()
+                    && !self.modifiers.super_key()
+                {
+                    choice = self.close_dialog.as_mut().unwrap().key(&event.logical_key);
+                }
+            }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.pointer_inside = true;
+                self.cursor_position = (position.x, position.y);
+                let hit = self.renderer.as_ref().and_then(|renderer| {
+                    renderer.close_dialog_geometry().hit(position.x, position.y)
+                });
+                self.close_dialog.as_mut().unwrap().hover(hit);
+                if let Some(window) = &self.window {
+                    window.set_cursor(if hit.is_some() {
+                        CursorIcon::Pointer
+                    } else {
+                        CursorIcon::Default
+                    });
+                }
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let hit = self.renderer.as_ref().and_then(|renderer| {
+                    renderer
+                        .close_dialog_geometry()
+                        .hit(self.cursor_position.0, self.cursor_position.1)
+                });
+                choice = self
+                    .close_dialog
+                    .as_mut()
+                    .unwrap()
+                    .mouse(hit, *state == ElementState::Pressed);
+            }
+            WindowEvent::Ime(_)
+            | WindowEvent::MouseInput { .. }
+            | WindowEvent::MouseWheel { .. } => {}
+            WindowEvent::CursorEntered { .. } => self.pointer_inside = true,
+            WindowEvent::CursorLeft { .. } => self.pointer_inside = false,
+            WindowEvent::Focused(focused) => {
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.set_focused(*focused);
+                }
+            }
+            _ => return false,
+        }
+        if let Some(choice) = choice {
+            self.choose_close_dialog(choice, event_loop);
+        } else {
+            self.refresh_close_dialog();
+        }
+        true
     }
 
     fn set_font_size(&mut self, points: f32) {
@@ -173,7 +303,7 @@ impl WispApp {
         if let Some(renderer) = self.renderer.as_mut() {
             if let Some(snapshot) = session.try_snapshot() {
                 renderer.set_snapshot(snapshot);
-                if self.pointer_inside {
+                if self.pointer_inside && self.close_dialog.is_none() {
                     session.send(Command::Hover {
                         x: self.cursor_position.0,
                         y: self.cursor_position.1,
@@ -235,6 +365,9 @@ impl WispApp {
                     }
                 }
                 terminal::SessionEvent::Hover(hover) => {
+                    if self.close_dialog.is_some() {
+                        continue;
+                    }
                     if self.pointer != hover.pointer {
                         self.pointer = hover.pointer;
                         if let Some(window) = self.window.as_ref() {
@@ -315,8 +448,11 @@ impl ApplicationHandler<UserEvent> for WispApp {
         if window_id != window.id() {
             return;
         }
+        if self.close_dialog_event(&event, event_loop) {
+            return;
+        }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => self.request_close(event_loop),
             WindowEvent::Occluded(false) => window.request_redraw(),
             WindowEvent::Resized(size) => {
                 self.resize(size);
@@ -373,8 +509,8 @@ impl ApplicationHandler<UserEvent> for WispApp {
                     ElementState::Released => libghostty_vt::key::Action::Release,
                 };
                 if let PhysicalKey::Code(code) = event.physical_key
-                    && event.state == ElementState::Released
-                    && self.consumed_keys.remove(&code)
+                    && ((event.state == ElementState::Released && self.consumed_keys.remove(&code))
+                        || (event.repeat && self.consumed_keys.contains(&code)))
                 {
                     return;
                 }

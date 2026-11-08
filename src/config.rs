@@ -349,11 +349,21 @@ impl<'de> Deserialize<'de> for Margins {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct WindowConfig {
     #[serde(alias = "window_margin_width")]
     pub margin_width: Margins,
+    pub confirm_on_close: bool,
+}
+
+impl Default for WindowConfig {
+    fn default() -> Self {
+        Self {
+            margin_width: Margins::default(),
+            confirm_on_close: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -706,6 +716,7 @@ mod tests {
         assert_eq!(config.font.family, "monospace");
         assert_eq!(config.font.size, 11.0);
         assert_eq!(config.window.margin_width, Margins::uniform(21.75));
+        assert!(config.window.confirm_on_close);
         assert!(config.font.ligatures);
         assert_eq!(config.cursor.shape, CursorShape::Beam);
         assert!(config.cursor.smooth);
@@ -798,6 +809,14 @@ kitty_graphics = false
                 PathBuf::from("/project/.config/wisp/config.toml"),
             ]
         );
+    }
+
+    #[test]
+    fn close_confirmation_can_be_disabled_without_changing_other_window_defaults() {
+        let config: Config = toml::from_str("[window]\nconfirm_on_close = false").unwrap();
+        assert!(!config.window.confirm_on_close);
+        assert_eq!(config.window.margin_width, Margins::default());
+        assert!(toml::from_str::<Config>("[window]\nconfirm_on_close = 'yes'").is_err());
     }
 
     #[test]

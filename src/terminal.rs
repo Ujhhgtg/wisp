@@ -370,6 +370,9 @@ pub enum Command {
 }
 
 pub struct Session {
+    child_pid: Option<u32>,
+    explicit_command: bool,
+    shell_executable: Option<std::path::PathBuf>,
     command_tx: SyncSender<Command>,
     snapshot_slot: Arc<Mutex<Option<TerminalSnapshot>>>,
     event_rx: Receiver<SessionEvent>,
@@ -414,7 +417,14 @@ impl Session {
         rows: u16,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
-        Self::spawn_command(config, cols, rows, CommandBuilder::new(shell))
+        Self::spawn_inner(
+            config,
+            cols,
+            rows,
+            CommandBuilder::new(shell),
+            Arc::new(|| {}),
+            false,
+        )
     }
 
     pub fn spawn_with_waker(
@@ -424,7 +434,7 @@ impl Session {
         wake: SessionWake,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
-        Self::spawn_command_with_waker(config, cols, rows, CommandBuilder::new(shell), wake)
+        Self::spawn_inner(config, cols, rows, CommandBuilder::new(shell), wake, false)
     }
 
     pub fn spawn_command(
@@ -440,8 +450,19 @@ impl Session {
         config: Config,
         cols: u16,
         rows: u16,
+        command: CommandBuilder,
+        wake: SessionWake,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::spawn_inner(config, cols, rows, command, wake, true)
+    }
+
+    fn spawn_inner(
+        config: Config,
+        cols: u16,
+        rows: u16,
         mut command: CommandBuilder,
         wake: SessionWake,
+        explicit_command: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -452,7 +473,16 @@ impl Session {
         })?;
 
         crate::terminfo::configure_environment(&mut command);
+        let shell_executable = if explicit_command {
+            None
+        } else {
+            command
+                .get_argv()
+                .first()
+                .and_then(|program| std::fs::canonicalize(program).ok())
+        };
         let mut child = pair.slave.spawn_command(command)?;
+        let child_pid = child.process_id();
         drop(pair.slave);
 
         let reader = pair.master.try_clone_reader()?;
@@ -495,6 +525,9 @@ impl Session {
             })?;
 
         Ok(Self {
+            child_pid,
+            explicit_command,
+            shell_executable,
             command_tx,
             snapshot_slot,
             event_rx,
@@ -512,6 +545,16 @@ impl Session {
 
     pub fn try_event(&self) -> Option<SessionEvent> {
         self.event_rx.try_recv().ok()
+    }
+
+    pub fn needs_close_confirmation(&self) -> std::io::Result<bool> {
+        if crate::close_confirmation::needs_confirmation(self.child_pid, self.explicit_command)? {
+            return Ok(true);
+        }
+        if let Some(executable) = &self.shell_executable {
+            return crate::close_confirmation::shell_was_replaced(self.child_pid, executable);
+        }
+        Ok(false)
     }
 }
 
