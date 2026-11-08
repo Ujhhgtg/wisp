@@ -1,0 +1,13 @@
+diff --git a/src/terminal/page.zig b/src/terminal/page.zig
+--- a/src/terminal/page.zig
++++ b/src/terminal/page.zig
+@@ -97,3 +97,3 @@
+     Offset(u21).Slice,
+-    hash_map.default_max_load_percentage,
++    80,
+ );
+@@ -1678,3 +1678,3 @@
+     pub inline fn graphemeCapacity(self: *const Page) usize {
+-        return self.grapheme_map.map(self.memory).capacity();
++        return self.grapheme_map.map(self.memory).maxLoad();
+     }

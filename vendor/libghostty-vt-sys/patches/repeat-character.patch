@@ -1,0 +1,22 @@
+diff --git a/src/terminal/Terminal.zig b/src/terminal/Terminal.zig
+--- a/src/terminal/Terminal.zig
++++ b/src/terminal/Terminal.zig
+@@ -361,6 +361,16 @@
+ pub fn printRepeat(self: *Terminal, count_req: usize) !void {
+     if (self.previous_char) |c| {
+-        const count = @max(count_req, 1);
+-        for (0..count) |_| try self.print(c);
++        var remaining = @max(count_req, 1);
++        if (c >= 0x20 and c <= 0x7E and remaining >= 8) {
++            var buffer: [128]u32 = undefined;
++            for (buffer[0..@min(remaining, buffer.len)]) |*cp| cp.* = c;
++            while (remaining > 0) {
++                const count = @min(remaining, buffer.len);
++                try self.printSlice(buffer[0..count]);
++                remaining -= count;
++            }
++        } else {
++            for (0..remaining) |_| try self.print(c);
++        }
+     }
+ }

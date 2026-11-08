@@ -1,0 +1,25 @@
+[package]
+name = "wisp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
+bytemuck = { version = "1.23", features = ["derive"] }
+glyphon = "0.12"
+libghostty-vt = { version = "0.2.2", features = ["kitty-graphics", "png"] }
+memchr = "2.8"
+portable-pty = "0.9"
+pollster = "0.4"
+png = "0.18"
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.2"
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "wgsl", "vulkan", "gles"] }
+winit = { version = "0.30.12", features = ["rwh_06", "x11", "wayland"] }
+
+[dev-dependencies]
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+
+[patch.crates-io]
+libghostty-vt-sys = { path = "vendor/libghostty-vt-sys" }
