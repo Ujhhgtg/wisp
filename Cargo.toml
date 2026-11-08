@@ -2,6 +2,7 @@
 name = "wisp"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
