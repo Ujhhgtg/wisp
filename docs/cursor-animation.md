@@ -17,9 +17,12 @@ leading corners move immediately and the trailing corners take 150 ms.
 Horizontal jumps of at most two cells use Neovide's 40 ms short-jump
 duration for every corner. The result is one deforming quadrilateral.
 
-The default beam and underline thickness is one eighth of a cell, matching
-Neovide. `cell_percentage` can instead supply the terminal's configured
-beam or underline thickness. Disabling `trail` gives every corner the same
+The beam is two logical pixels wide and one full cell high, matching
+[Zed's default bar cursor](https://github.com/zed-industries/zed/blob/b5cd310b3b54dfc659fcc06453e6358843dfe216/crates/editor/src/element.rs#L11081).
+Zed's terminal uses the same `CursorLayout` as its editor. Wisp scales the beam
+width with the display scale factor, independently of font size. The underline
+thickness remains one eighth of a cell, matching Neovide; `cell_percentage`
+controls that thickness. Disabling `trail` gives every corner the same
 duration; disabling `smooth` snaps all corners immediately.
 
 Wisp snaps the first appearance, reappearance after a prolonged hide, and

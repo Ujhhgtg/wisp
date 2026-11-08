@@ -1,4 +1,5 @@
 const SHORT_ANIMATION_LENGTH: f32 = 0.04;
+pub const DEFAULT_BEAM_WIDTH: f32 = 2.0;
 const STANDARD_CORNERS: [[f32; 2]; 4] = [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13,6 +14,7 @@ pub struct CursorAnimationOptions {
     pub smooth: bool,
     pub trail: bool,
     pub duration_seconds: f32,
+    pub beam_width: f32,
     pub cell_percentage: f32,
 }
 
@@ -22,6 +24,7 @@ impl Default for CursorAnimationOptions {
             smooth: true,
             trail: true,
             duration_seconds: 0.150,
+            beam_width: DEFAULT_BEAM_WIDTH,
             cell_percentage: 1.0 / 8.0,
         }
     }
@@ -177,6 +180,7 @@ impl CursorAnimation {
             };
         }
         options.duration_seconds = finite_or(options.duration_seconds, 0.150).max(0.0);
+        options.beam_width = finite_or(options.beam_width, DEFAULT_BEAM_WIDTH).max(0.0);
         options.cell_percentage = finite_or(options.cell_percentage, 1.0 / 8.0).clamp(0.0, 1.0);
         let dt = finite_or(dt, 0.0).max(0.0);
         let dimensions = [cell_rect[2], cell_rect[3]];
@@ -193,7 +197,7 @@ impl CursorAnimation {
             corner.relative_position = match shape {
                 CursorShape::Block => relative_position,
                 CursorShape::Beam => [
-                    (relative_position[0] + 0.5) * options.cell_percentage - 0.5,
+                    (relative_position[0] + 0.5) * options.beam_width / dimensions[0] - 0.5,
                     relative_position[1],
                 ],
                 CursorShape::Underline => [

@@ -11,7 +11,9 @@ use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 use crate::config::{Config, CursorShape};
-use crate::cursor::{CursorAnimation, CursorAnimationOptions, CursorShape as AnimatedCursorShape};
+use crate::cursor::{
+    CursorAnimation, CursorAnimationOptions, CursorShape as AnimatedCursorShape, DEFAULT_BEAM_WIDTH,
+};
 use crate::geometry::GridGeometry;
 use crate::graphics::{GraphicsSnapshot, ImageLayer};
 use crate::image_renderer::ImageRenderer;
@@ -966,6 +968,7 @@ impl Renderer {
                 smooth: self.config.cursor.smooth && self.focused,
                 trail: self.config.cursor.trail,
                 duration_seconds: self.config.cursor.trail_duration_ms as f32 / 1000.0,
+                beam_width: DEFAULT_BEAM_WIDTH * self.scale_factor,
                 ..Default::default()
             },
         );
@@ -1763,6 +1766,48 @@ mod tests {
             changed_cells.contains(&0) && changed_cells.contains(&1),
             "both halves of ~> must have visible pixels"
         );
+    }
+
+    #[test]
+    fn beam_cursor_matches_zed_width_across_font_sizes_and_display_scales() {
+        let mut config = Config::default();
+        config.cursor.blink = false;
+        config.cursor.smooth = false;
+        config.colors.cursor = crate::config::Color::new(255, 0, 0);
+        let mut renderer = offscreen(config.clone());
+        for scale in [1.0, 1.5, 2.0] {
+            renderer.set_scale_factor(scale);
+            for font_size in [8.0, 11.0, 22.0] {
+                renderer.set_font_size(font_size).unwrap();
+                let mut frame = snapshot(&config, 8, 1);
+                frame.cursor = CursorSnapshot {
+                    column: 2,
+                    row: 0,
+                    visible: true,
+                    blinking: false,
+                    shape: CursorShape::Beam,
+                };
+                renderer.set_snapshot(frame);
+                let rgba = capture(&mut renderer);
+                let geometry = renderer.geometry();
+                let (left, top) = geometry.cell_origin(2, 0);
+                let expected_width = (2.0 * scale) as u32;
+                for row in 0..geometry.cell_height {
+                    for offset in 0..geometry.cell_width.max(expected_width + 1) {
+                        let expected = if offset < expected_width {
+                            [255, 0, 0, 255]
+                        } else {
+                            [0, 0, 0, 255]
+                        };
+                        assert_eq!(
+                            pixel(&rgba, renderer.size.width, left + offset, top + row),
+                            expected,
+                            "scale {scale}, font size {font_size}, pixel {offset},{row}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
