@@ -3037,6 +3037,7 @@ dependencies = [
  "portable-pty",
  "serde",
  "toml",
+ "unicode-width",
  "wayland-client",
  "wayland-protocols-misc",
  "wayland-protocols-wlr",

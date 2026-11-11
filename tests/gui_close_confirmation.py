@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import time
 
-from PIL import Image, ImageChops
+from PIL import Image
 
 from gui_smoke import ROOT, dispatch, find_client, run, set_window_property, wait_for
 
@@ -83,13 +83,17 @@ def main():
 
         def click(process, close):
             client = find_client(process.pid)
-            width, height = client["size"]
-            scale = monitor["scale"]
-            gap = min(16 * scale, width / 12)
-            button_width = min(180 * scale, (width - 3 * gap) / 2)
-            left = (width - 2 * button_width - gap) / 2
-            x = client["at"][0] + left + button_width / 2 + (0 if close else button_width + gap)
-            y = client["at"][1] + height * 0.6 + min(40 * scale, height / 6) / 2
+            image = screenshot(process, "click-target")
+            yellow = [(x, y) for y in range(image.height) for x in range(image.width)
+                      if (lambda color: color[0] > 120 and color[1] > 100 and color[2] < 100)(image.getpixel((x, y))) ]
+            assert yellow, "selected Kitty frame must be yellow"
+            left = min(point[0] for point in yellow)
+            right = max(point[0] for point in yellow)
+            top = min(point[1] for point in yellow)
+            bottom = max(point[1] for point in yellow)
+            cell_width = (right - left + 1) / 7
+            x = client["at"][0] + (left + right) / 2 + (0 if close else 8.5 * cell_width)
+            y = client["at"][1] + (top + bottom) / 2
             run(str(ROOT / "target/debug/examples/pointer_driver"), "click", str(round(x)), str(round(y)), str(monitor["width"]), str(monitor["height"]))
 
         try:
@@ -106,21 +110,19 @@ def main():
                 key("Return")
                 time.sleep(0.2)
                 dialog(process, log)
-                key("Return")
-                wait_for(lambda: "close-dialog-cancelled" in log.read_text(), "safe default")
+                key("Escape")
+                wait_for(lambda: "close-dialog-cancelled" in log.read_text(), "escape cancellation")
                 assert process.poll() is None
                 dialog(process, log, 2)
-                key("Tab")
                 key("Return")
                 process.wait(timeout=5)
-                print("PASS fish " + name + " job, safe default, and keyboard confirmation", flush=True)
+                print("PASS fish " + name + " job, Escape cancellation, and Kitty default Yes", flush=True)
 
-            localized = []
             for name, locale in [("english", "en_US.UTF-8"), ("simplified", "zh_CN.UTF-8"), ("traditional", "zh_TW.UTF-8")]:
                 capture = directory / f"{name}-input"
                 process, log = launch(name, ["python3", "-u", "-c", PROBE, str(capture)], locale)
                 dialog(process, log)
-                localized.append(screenshot(process, name))
+                screenshot(process, name)
                 baseline = capture.read_bytes() if capture.exists() else b""
                 key("Left")
                 key("Right")
@@ -136,8 +138,6 @@ def main():
                 click(process, True)
                 process.wait(timeout=5)
                 print("PASS " + name + " dialog, keyboard/mouse isolation, and command confirmation", flush=True)
-            assert ImageChops.difference(localized[0], localized[1]).getbbox()
-            assert ImageChops.difference(localized[1], localized[2]).getbbox()
 
             process, log = launch("resized", ["python3", "-u", "-c", PROBE, str(directory / "resize-input")])
             dialog(process, log)

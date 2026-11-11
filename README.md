@@ -51,13 +51,22 @@ launched with `-e` is still running. An idle default shell closes immediately.
 Replacing the default shell with `exec` also asks before closing. Set it to
 `false` to always close without asking.
 
-The confirmation fills the window and supports mouse clicks, `Y`/`N`,
-`Tab`/arrow keys, `Enter`, and `Esc`. “Keep open” is selected initially.
-It uses English, Simplified Chinese, or Traditional Chinese according to
-`LC_ALL`, then `LC_MESSAGES`, then `LANG`; unsupported locales use English.
-Chinese script subtags are respected, with CN/SG selecting Simplified and
-TW/HK/MO selecting Traditional when no script is specified. Job inspection
-runs only on close; it does not poll while the terminal is idle or parsing.
+The English-only confirmation follows Kitty's `kitten ask` cell layout,
+including the centered bold message, compact three-row box-drawing buttons,
+colored shortcut letters, and yellow default-choice frame. `Y` / `N`, `Enter`,
+`Esc` / `Ctrl+C`, and mouse clicks match Kitty. Enter selects Yes, as in Kitty.
+Job inspection runs only on close, with no periodic process polling.
+
+Clipboard and primary-selection pastes use Kitty's default control-code warning:
+control characters (including ESC, CR, and DEL) require confirmation, as do
+newlines when bracketed paste is disabled. The dialog offers **Sanitize and
+paste** (`S`, the default), **Paste anyway** (`A`), and **Cancel** (`C`). Sanitizing
+replaces control characters with visible control pictures and unbracketed
+newlines with NEL (`ESC E`). Paste anyway preserves the original control codes;
+bracketed-paste terminators are removed before wrapping, as in Kitty. Ordinary
+text and bracketed newlines do not warn. The policy applies at the live VT state
+when the paste is requested. Kitty's optional large-paste warning is not enabled
+by default and is not part of this policy.
 
 ## validation
 
@@ -67,4 +76,5 @@ cargo build --release
 cargo build --example keyboard_driver --example pointer_driver
 python3 tests/gui_smoke.py
 python3 tests/gui_close_confirmation.py
+python3 tests/gui_paste_warning.py
 ```

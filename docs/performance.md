@@ -188,8 +188,16 @@ was discarded after paired measurements.
 Differential native tests cover every byte around vector boundaries and every
 split of mixed UTF-8/control input; all 147 native stream tests pass. The Rust
 prefilter test covers all escape suffix bytes at search/chunk boundaries. The
-full Rust run passes 246 tests, and strict Clippy passes for all targets and
+full Rust run passes 259 tests, and strict Clippy passes for all targets and
 features. The release also passes the complete general GUI smoke, graphics
 placeholder/relative-placement animation checks, default `icat` GIF playback
 after client exit, and the selected external VTTEST cases. The long-OSC
 optimization remains enabled throughout.
+
+The Kitty compatibility checks also cover the close and paste overlays. A
+cell-level comparison against `kitten ask` verifies the three-row box-drawing
+layout, bold text, shortcut colors, selected-frame yellow, fallback wrapping,
+and compact layouts. The paste suite verifies Kitty's warning triggers and
+sanitization: control pictures for C0/DEL, `ESC E` for unsafe unbracketed
+newlines, bracketed-paste terminator removal, and exact approval/cancellation
+bytes at the PTY boundary.

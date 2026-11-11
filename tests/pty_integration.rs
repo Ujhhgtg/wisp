@@ -291,6 +291,58 @@ fn ordinary_paste_converts_newlines_to_carriage_returns() {
 }
 
 #[test]
+fn dangerous_user_paste_waits_for_approval_and_sanitizes_like_kitty() {
+    let session = spawn_probe("plain");
+    session.send(Command::RequestPaste("one\n\x03two".to_owned()));
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let sanitized = loop {
+        if let Some(SessionEvent::PasteWarning {
+            original,
+            sanitized,
+        }) = session.try_event()
+        {
+            assert_eq!(original, "one\n\x03two");
+            break sanitized;
+        }
+        assert!(Instant::now() < deadline, "paste warning missing");
+        thread::sleep(Duration::from_millis(2));
+    };
+    assert_eq!(sanitized, "one\x1bE␃two");
+    session.send(Command::PasteApproved(sanitized));
+    assert_eq!(finish(&session), "one\x1bE␃two".as_bytes());
+}
+
+#[test]
+fn bracketed_newlines_do_not_warn_and_approved_paste_strips_only_terminators() {
+    let session = spawn_probe("paste");
+    session.send(Command::RequestPaste("one\ntwo".to_owned()));
+    assert_eq!(finish(&session), b"\x1b[200~one\ntwo\x1b[201~");
+    let session = spawn_probe("paste");
+    session.send(Command::PasteApproved(
+        "\x03\x1b[201~\x1b[20\x1b[201~1~ok".to_owned(),
+    ));
+    assert_eq!(finish(&session), b"\x1b[200~\x03ok\x1b[201~");
+}
+
+#[test]
+fn paste_anyway_preserves_control_codes_and_cancelling_delivers_nothing() {
+    let session = spawn_probe("plain");
+    session.send(Command::PasteApproved("one\r\ntwo\x03".to_owned()));
+    assert_eq!(finish(&session), b"one\rtwo\x03");
+    let session = spawn_probe("plain");
+    session.send(Command::RequestPaste("one\n".to_owned()));
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        if let Some(SessionEvent::PasteWarning { .. }) = session.try_event() {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(finish(&session), b"");
+}
+
+#[test]
 fn real_pty_round_trip_answers_terminal_device_status_queries() {
     let session = spawn_probe("queries");
     assert_eq!(finish(&session), b"\x1b[7;13R\x1b[0n");

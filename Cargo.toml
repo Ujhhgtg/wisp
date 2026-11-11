@@ -21,6 +21,7 @@ pollster = "0.4"
 png = "0.18"
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.2"
+unicode-width = "0.2"
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "wgsl", "vulkan", "gles"] }
 winit = { version = "0.30.12", features = ["rwh_06", "x11", "wayland"] }
 

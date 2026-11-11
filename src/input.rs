@@ -240,6 +240,36 @@ impl InputState {
         })
     }
 
+    pub fn paste_approved(
+        &mut self,
+        terminal: &mut Terminal<'static, '_>,
+        text: String,
+        config: &Config,
+    ) -> Result<InputResult, Error> {
+        let bracketed = config.protocols.bracketed_paste && terminal.mode(Mode::BRACKETED_PASTE)?;
+        let bytes = if bracketed {
+            let mut bytes = text.into_bytes();
+            loop {
+                let previous = bytes.len();
+                for terminator in [b"\x1b[201~".as_slice(), b"\x9b201~".as_slice()] {
+                    while let Some(offset) = memchr::memmem::find(&bytes, terminator) {
+                        bytes.drain(offset..offset + terminator.len());
+                    }
+                }
+                if bytes.len() == previous {
+                    break;
+                }
+            }
+            let mut output = b"\x1b[200~".to_vec();
+            output.extend(bytes);
+            output.extend_from_slice(b"\x1b[201~");
+            output
+        } else {
+            text.replace("\r\n", "\n").replace('\n', "\r").into_bytes()
+        };
+        self.input_bytes(terminal, bytes)
+    }
+
     pub fn pointer(
         &mut self,
         terminal: &mut Terminal<'static, '_>,

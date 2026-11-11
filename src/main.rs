@@ -13,7 +13,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, KeyCode, ModifiersState, PhysicalKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{CursorIcon, Window, WindowId};
-use wisp::close_confirmation::{Choice, CloseDialog, Language};
+use wisp::close_confirmation::{Choice, CloseDialog, DialogKind};
 use wisp::{config, renderer, terminal};
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -63,6 +63,8 @@ struct WispApp {
     consumed_keys: HashSet<KeyCode>,
     default_font_size: f32,
     close_dialog: Option<CloseDialog>,
+    pending_paste: Option<(String, String)>,
+    terminal_title: String,
 }
 
 impl WispApp {
@@ -92,6 +94,8 @@ impl WispApp {
             consumed_keys: HashSet::new(),
             default_font_size,
             close_dialog: None,
+            pending_paste: None,
+            terminal_title: "Wisp".to_owned(),
         }
     }
 
@@ -116,7 +120,14 @@ impl WispApp {
 
     fn request_close(&mut self, event_loop: &ActiveEventLoop) {
         if self.close_dialog.is_some() {
-            return;
+            if self
+                .close_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.kind == DialogKind::Close)
+            {
+                return;
+            }
+            self.pending_paste = None;
         }
         let needs_confirmation = self.config.window.confirm_on_close
             && self.session.as_ref().is_some_and(|session| {
@@ -129,8 +140,23 @@ impl WispApp {
             event_loop.exit();
             return;
         }
-        self.close_dialog = Some(CloseDialog::new(Language::system()));
+        let message = self
+            .session
+            .as_ref()
+            .map(Session::close_message)
+            .unwrap_or_default();
+        self.show_dialog(CloseDialog::new(message));
         wisp::diagnostics::trace("close-dialog-open");
+    }
+
+    fn show_dialog(&mut self, dialog: CloseDialog) {
+        if let Some(window) = &self.window {
+            window.set_title(match dialog.kind {
+                DialogKind::Close => "Close window?",
+                DialogKind::Paste => "Allow paste?",
+            });
+        }
+        self.close_dialog = Some(dialog);
         self.ime_composing = false;
         if let Some(renderer) = &mut self.renderer {
             renderer.set_preedit(String::new());
@@ -153,14 +179,23 @@ impl WispApp {
     }
 
     fn choose_close_dialog(&mut self, choice: Choice, event_loop: &ActiveEventLoop) {
-        if choice == Choice::Close {
+        let kind = self.close_dialog.as_ref().map(|dialog| dialog.kind);
+        if kind == Some(DialogKind::Close) && choice == Choice::Close {
             event_loop.exit();
         } else {
+            if let Some((original, sanitized)) = self.pending_paste.take() {
+                match choice {
+                    Choice::Sanitize => self.send(Command::PasteApproved(sanitized)),
+                    Choice::PasteAnyway => self.send(Command::PasteApproved(original)),
+                    _ => {}
+                }
+            }
             self.close_dialog = None;
             wisp::diagnostics::trace("close-dialog-cancelled");
             if let Some(window) = &self.window {
                 window.set_ime_allowed(true);
                 window.set_cursor(self.pointer);
+                window.set_title(&self.terminal_title);
             }
             self.refresh_close_dialog();
         }
@@ -182,21 +217,29 @@ impl WispApp {
                 }
                 if event.state == ElementState::Pressed
                     && !event.repeat
-                    && !self.modifiers.control_key()
                     && !self.modifiers.alt_key()
                     && !self.modifiers.super_key()
                 {
-                    choice = self.close_dialog.as_mut().unwrap().key(&event.logical_key);
+                    choice = if self.modifiers.control_key() {
+                        match &event.logical_key {
+                            Key::Character(text) if text.eq_ignore_ascii_case("c") => {
+                                Some(Choice::Cancel)
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        self.close_dialog.as_mut().unwrap().key(&event.logical_key)
+                    };
                 }
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer_inside = true;
                 self.cursor_position = (position.x, position.y);
-                let hit = self.renderer.as_ref().and_then(|renderer| {
-                    renderer.close_dialog_geometry().hit(position.x, position.y)
-                });
-                self.close_dialog.as_mut().unwrap().hover(hit);
+                let hit = self
+                    .renderer
+                    .as_ref()
+                    .and_then(|renderer| renderer.dialog_hit(position.x, position.y));
                 if let Some(window) = &self.window {
                     window.set_cursor(if hit.is_some() {
                         CursorIcon::Pointer
@@ -211,9 +254,7 @@ impl WispApp {
                 ..
             } => {
                 let hit = self.renderer.as_ref().and_then(|renderer| {
-                    renderer
-                        .close_dialog_geometry()
-                        .hit(self.cursor_position.0, self.cursor_position.1)
+                    renderer.dialog_hit(self.cursor_position.0, self.cursor_position.1)
                 });
                 choice = self
                     .close_dialog
@@ -235,8 +276,6 @@ impl WispApp {
         }
         if let Some(choice) = choice {
             self.choose_close_dialog(choice, event_loop);
-        } else {
-            self.refresh_close_dialog();
         }
         true
     }
@@ -316,6 +355,7 @@ impl WispApp {
                 window.set_ime_cursor_area(position, size);
             }
         }
+        let mut paste_warning = false;
         while let Some(event) = session.try_event() {
             match event {
                 terminal::SessionEvent::Bell => {
@@ -347,22 +387,37 @@ impl WispApp {
                     }
                 }
                 terminal::SessionEvent::PastePrimary => {
+                    if self.close_dialog.is_some() {
+                        continue;
+                    }
                     if let Some(clipboard) = self.clipboard.as_mut()
                         && let Ok(text) = clipboard
                             .get()
                             .clipboard(LinuxClipboardKind::Primary)
                             .text()
                     {
-                        session.send(Command::Paste(text));
+                        session.send(Command::RequestPaste(text));
+                    }
+                }
+                terminal::SessionEvent::PasteWarning {
+                    original,
+                    sanitized,
+                } => {
+                    if self.close_dialog.is_none() && self.pending_paste.is_none() {
+                        self.pending_paste = Some((original, sanitized));
+                        paste_warning = true;
                     }
                 }
                 terminal::SessionEvent::Error(error) => {
                     eprintln!("terminal error: {error}");
                 }
                 terminal::SessionEvent::Title(title) => {
-                    if let Some(window) = self.window.as_ref() {
+                    if self.close_dialog.is_none()
+                        && let Some(window) = self.window.as_ref()
+                    {
                         window.set_title(&title);
                     }
+                    self.terminal_title = title;
                 }
                 terminal::SessionEvent::Hover(hover) => {
                     if self.close_dialog.is_some() {
@@ -385,6 +440,10 @@ impl WispApp {
                 }
                 terminal::SessionEvent::Exited => event_loop.exit(),
             }
+        }
+        if paste_warning {
+            self.show_dialog(CloseDialog::paste());
+            wisp::diagnostics::trace("paste-dialog-open");
         }
         if let Some(renderer) = self.renderer.as_mut()
             && matches!(renderer.render(), renderer::RenderOutcome::Reconfigure)
@@ -558,7 +617,7 @@ impl ApplicationHandler<UserEvent> for WispApp {
                             if let Some(clipboard) = self.clipboard.as_mut()
                                 && let Ok(text) = clipboard.get_text()
                             {
-                                self.send(Command::Paste(text));
+                                self.send(Command::RequestPaste(text));
                             }
                             return;
                         }

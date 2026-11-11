@@ -10,7 +10,7 @@ use glyphon::{
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
-use crate::close_confirmation::{Choice, CloseDialog, DialogGeometry};
+use crate::close_confirmation::{Choice, CloseDialog};
 use crate::config::{Config, CursorShape};
 use crate::cursor::{
     CursorAnimation, CursorAnimationOptions, CursorShape as AnimatedCursorShape, DEFAULT_BEAM_WIDTH,
@@ -330,11 +330,30 @@ impl Renderer {
     }
 
     pub fn set_close_confirmation(&mut self, dialog: Option<CloseDialog>) {
+        if dialog.is_none() {
+            if let Some(snapshot) = &self.snapshot {
+                match self.layout.shape(snapshot) {
+                    Ok(true) => self.reset_atlas(),
+                    Ok(false) => {}
+                    Err(error) => eprintln!("text shaping failed: {error}"),
+                }
+            }
+            self.text_prepared = false;
+        }
         self.close_confirmation = dialog;
     }
 
-    pub fn close_dialog_geometry(&self) -> DialogGeometry {
-        DialogGeometry::new(self.size.width, self.size.height, self.scale_factor)
+    pub fn dialog_hit(&self, x: f64, y: f64) -> Option<Choice> {
+        let geometry = self.geometry();
+        let column = (x - f64::from(geometry.origin_x)) / f64::from(geometry.cell_width);
+        let row = (y - f64::from(geometry.origin_y)) / f64::from(geometry.cell_height);
+        if column < 0.0 || row < 0.0 {
+            return None;
+        }
+        self.close_confirmation
+            .as_ref()?
+            .layout(geometry.cols, geometry.rows, &self.config)
+            .hit(column as usize, row as usize)
     }
 
     pub fn set_focused(&mut self, focused: bool) {
@@ -667,173 +686,20 @@ impl Renderer {
         view: &wgpu::TextureView,
         dialog: &CloseDialog,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let geometry = self.close_dialog_geometry();
-        let text = dialog.language.text();
-        let foreground: Rgb = self.config.colors.foreground.into();
-        let background: Rgb = self.config.colors.background.into();
-        let font_size = self
-            .layout
-            .metrics
-            .font_size
-            .clamp(12.0 * self.scale_factor, 20.0 * self.scale_factor)
-            .min(self.size.height as f32 / 18.0);
-        let line_height = font_size * 1.5;
-        let button_color = |choice| {
-            if dialog.selected == choice {
-                background
-            } else {
-                foreground
-            }
-        };
-        let entries = [
-            (
-                format!("{}\n\n{}", text.title, text.message),
-                geometry.body,
-                foreground,
-            ),
-            (
-                text.close.to_owned(),
-                geometry.close,
-                button_color(Choice::Close),
-            ),
-            (
-                text.cancel.to_owned(),
-                geometry.cancel,
-                button_color(Choice::Cancel),
-            ),
-            (text.help.to_owned(), geometry.help, foreground),
-        ];
-        let mut buffers = Vec::with_capacity(entries.len());
-        for (text, bounds, _) in &entries {
-            let mut buffer = Buffer::new(
-                &mut self.layout.font_system,
-                Metrics::new(font_size, line_height),
-            );
-            buffer.set_size(Some(bounds[2]), Some(bounds[3]));
-            buffer.set_wrap(Wrap::WordOrGlyph);
-            buffer.set_text(
-                text,
-                &Attrs::new().family(Family::Name(&self.layout.family)),
-                Shaping::Advanced,
-                Some(glyphon::cosmic_text::Align::Center),
-            );
-            buffer.shape_until_scroll(&mut self.layout.font_system, false);
-            buffers.push(buffer);
+        let geometry = self.geometry();
+        let frame = dialog
+            .layout(geometry.cols, geometry.rows, &self.config)
+            .frame;
+        let previous = self.snapshot.replace(frame);
+        let active = self.close_confirmation.take();
+        if self.layout.shape(self.snapshot.as_ref().unwrap())? {
+            self.reset_atlas();
         }
-        self.viewport.update(
-            &self.queue,
-            Resolution {
-                width: self.size.width,
-                height: self.size.height,
-            },
-        );
-        let areas = entries
-            .iter()
-            .zip(&buffers)
-            .map(|((_, bounds, color), buffer)| TextArea {
-                buffer,
-                left: bounds[0],
-                top: bounds[1]
-                    + if bounds[3] <= geometry.close[3] {
-                        (bounds[3] - line_height).max(0.0) / 2.0
-                    } else {
-                        0.0
-                    },
-                scale: 1.0,
-                bounds: TextBounds {
-                    left: bounds[0] as i32,
-                    top: bounds[1] as i32,
-                    right: (bounds[0] + bounds[2]) as i32,
-                    bottom: (bounds[1] + bounds[3]) as i32,
-                },
-                default_color: Color::rgb(color.red, color.green, color.blue),
-                custom_glyphs: &[],
-            });
-        let images = &self.layout.images;
-        self.preedit_renderer.prepare_with_custom(
-            &self.device,
-            &self.queue,
-            &mut self.layout.font_system,
-            &mut self.text_atlas,
-            &self.viewport,
-            areas,
-            &mut self.layout.swash_cache,
-            |request| images.get(&request.id).cloned(),
-        )?;
-        self.rect_vertices.clear();
-        for (choice, [left, top, width, height]) in [
-            (Choice::Close, geometry.close),
-            (Choice::Cancel, geometry.cancel),
-        ] {
-            let rectangles = if dialog.selected == choice {
-                vec![[left, top, width, height]]
-            } else {
-                vec![
-                    [left, top, width, self.scale_factor],
-                    [
-                        left,
-                        top + height - self.scale_factor,
-                        width,
-                        self.scale_factor,
-                    ],
-                    [left, top, self.scale_factor, height],
-                    [
-                        left + width - self.scale_factor,
-                        top,
-                        self.scale_factor,
-                        height,
-                    ],
-                ]
-            };
-            for rectangle in rectangles {
-                append_rect(
-                    &mut self.rect_vertices,
-                    rectangle,
-                    foreground,
-                    1.0,
-                    self.size,
-                    self.surface_config.format.is_srgb(),
-                );
-            }
-        }
-        self.queue.write_buffer(
-            &self.rect_buffer,
-            0,
-            bytemuck::cast_slice(&self.rect_vertices),
-        );
-        let clear = output_color(background, 1.0, self.surface_config.format.is_srgb());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("wisp close confirmation"),
-            });
-        let attachments = [Some(wgpu::RenderPassColorAttachment {
-            view,
-            depth_slice: None,
-            resolve_target: None,
-            ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(wgpu::Color {
-                    r: f64::from(clear[0]),
-                    g: f64::from(clear[1]),
-                    b: f64::from(clear[2]),
-                    a: 1.0,
-                }),
-                store: wgpu::StoreOp::Store,
-            },
-        })];
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("wisp close confirmation"),
-            color_attachments: &attachments,
-            ..Default::default()
-        });
-        pass.set_pipeline(&self.rect_pipeline);
-        pass.set_vertex_buffer(0, self.rect_buffer.slice(..));
-        pass.draw(0..self.rect_vertices.len() as u32, 0..1);
-        self.preedit_renderer
-            .render(&self.text_atlas, &self.viewport, &mut pass)?;
-        drop(pass);
-        self.queue.submit(Some(encoder.finish()));
-        Ok(())
+        self.text_prepared = false;
+        let result = self.draw_frame(view, Instant::now());
+        self.snapshot = previous;
+        self.close_confirmation = active;
+        result
     }
 
     fn prepare_cursor_text(
@@ -1568,39 +1434,22 @@ mod tests {
         }
         renderer.set_snapshot(frame);
         let terminal_pixels = capture(&mut renderer);
-        let mut localized_pixels = Vec::new();
-        for language in [
-            crate::close_confirmation::Language::English,
-            crate::close_confirmation::Language::SimplifiedChinese,
-            crate::close_confirmation::Language::TraditionalChinese,
-        ] {
-            renderer.set_close_confirmation(Some(CloseDialog::new(language)));
+        for dialog in [CloseDialog::new("Close?".to_owned()), CloseDialog::paste()] {
+            renderer.set_close_confirmation(Some(dialog.clone()));
             let rgba = capture(&mut renderer);
             assert_eq!(pixel(&rgba, 640, 0, 0), [0, 0, 0, 255]);
-            let geometry = renderer.close_dialog_geometry();
-            assert_eq!(
-                pixel(
-                    &rgba,
-                    640,
-                    geometry.cancel[0] as u32 + 2,
-                    geometry.cancel[1] as u32 + 2
-                ),
-                [255, 255, 255, 255]
-            );
-            assert_eq!(
-                pixel(
-                    &rgba,
-                    640,
-                    geometry.close[0] as u32 + 2,
-                    geometry.close[1] as u32 + 2
-                ),
-                [0, 0, 0, 255]
-            );
+            assert_ne!(rgba, terminal_pixels);
+            let geometry = renderer.geometry();
+            let layout = dialog.layout(geometry.cols, geometry.rows, &config);
+            for (choice, [column, row, _, _]) in layout.buttons {
+                let (left, top) = geometry.cell_origin(column as u16, row as u16);
+                assert_eq!(
+                    renderer.dialog_hit(f64::from(left), f64::from(top)),
+                    Some(choice)
+                );
+            }
             assert!(renderer.next_frame_deadline().is_none());
-            localized_pixels.push(rgba);
         }
-        assert_ne!(localized_pixels[0], localized_pixels[1]);
-        assert_ne!(localized_pixels[1], localized_pixels[2]);
         renderer.set_close_confirmation(None);
         assert_eq!(capture(&mut renderer), terminal_pixels);
     }

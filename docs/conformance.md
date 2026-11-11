@@ -151,11 +151,18 @@ do not correspond to the requested characters. Dependencies include Hyprland
 Lua dispatchers, `grim`, `wtype`, `xkbcli`, `wl-copy`, `wl-paste`, `kitten`, Python,
 and Pillow. Artifacts are written to `target/gui-smoke/`.
 
-The validated full run passes 256 automated tests, plus the explicitly invoked
+The validated full run passes 259 automated tests, plus the explicitly invoked
 external VTTEST integration. The latter is one ignored test in a normal Cargo
 run and is executed separately with the external binary available. The final
 release also passes the full general GUI smoke command above, with no skipped
 stages or assertions.
+
+Dialog compatibility is checked against the actual `kitten ask` executable in
+`tests/dialog_conformance.rs`: cell placement, glyphs, colors, bold attributes,
+and compact fallback layouts match at multiple grid sizes. The close and paste
+GUI suites verify keyboard/mouse routing and restore the terminal after cancel.
+Paste tests additionally assert exact approved/sanitized bytes, warning
+suppression for bracketed newlines, and bracketed-paste terminator removal.
 
 ## Performance validation
 

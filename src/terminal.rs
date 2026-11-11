@@ -318,6 +318,7 @@ pub enum SessionEvent {
     Clipboard(String),
     PrimarySelection(String),
     PastePrimary,
+    PasteWarning { original: String, sanitized: String },
     Title(String),
     Exited,
     Error(String),
@@ -330,6 +331,8 @@ pub enum Command {
     Output(Vec<u8>),
     Input(Vec<u8>),
     Paste(String),
+    RequestPaste(String),
+    PasteApproved(String),
     Geometry(GridGeometry),
     Hover {
         x: f64,
@@ -555,6 +558,10 @@ impl Session {
             return crate::close_confirmation::shell_was_replaced(self.child_pid, executable);
         }
         Ok(false)
+    }
+
+    pub fn close_message(&self) -> String {
+        crate::close_confirmation::close_message(self.child_pid)
     }
 }
 
@@ -853,8 +860,33 @@ fn run_terminal(
                     )?;
                 }
             }
-            Ok(Command::Paste(text)) => {
-                let result = input.paste(&mut terminal, text, &config)?;
+            Ok(
+                command
+                @ (Command::Paste(_) | Command::RequestPaste(_) | Command::PasteApproved(_)),
+            ) => {
+                let (text, checked, approved) = match command {
+                    Command::Paste(text) => (text, false, false),
+                    Command::RequestPaste(text) => (text, true, true),
+                    Command::PasteApproved(text) => (text, false, true),
+                    _ => unreachable!(),
+                };
+                let bracketed =
+                    config.protocols.bracketed_paste && terminal.mode(Mode::BRACKETED_PASTE)?;
+                if checked
+                    && let Some(sanitized) =
+                        crate::close_confirmation::sanitized_paste(&text, bracketed)
+                {
+                    let _ = event_tx.send(SessionEvent::PasteWarning {
+                        original: text,
+                        sanitized,
+                    });
+                    continue;
+                }
+                let result = if approved {
+                    input.paste_approved(&mut terminal, text, &config)?
+                } else {
+                    input.paste(&mut terminal, text, &config)?
+                };
                 interactive_echo_pending.set(!result.bytes.is_empty());
                 if deliver_input_result(&writer, &event_tx, &config, result)? {
                     send_snapshot(
