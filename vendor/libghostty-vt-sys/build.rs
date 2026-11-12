@@ -22,6 +22,7 @@ const WISP_PATCHES: &[&str] = &[
     "standard-host-reset.patch",
     "standard-performance.patch",
     "printable-runs.patch",
+    "selection-gesture-windows-time.patch",
 ];
 
 /// File name of the static archive on Windows. Ghostty installs it under this
@@ -184,6 +185,14 @@ fn build_vendored(link_mode: LinkMode, target: &str) {
         .arg("--cache-dir")
         .arg(&zig_cache_dir)
         .current_dir(&ghostty_dir);
+
+    // Zig 0.15.2's Clang is too old for recent Visual Studio C++ standard
+    // libraries, which makes Ghostty's SIMDUTF/Highway C++ path fail on a
+    // current Windows toolchain. The scalar terminal path is fully functional.
+    // Users with a compatible compiler can opt back in explicitly.
+    if target.contains("windows") && env::var_os("LIBGHOSTTY_VT_SYS_SIMD").is_none() {
+        build.arg("-Dsimd=false");
+    }
 
     // Package managers can provide Ghostty's Zig package cache ahead of time
     // and ask Zig to resolve packages from that immutable store path instead
@@ -389,6 +398,14 @@ fn apply_native_patches(source: &Path) {
     if previous == combined {
         return;
     }
+    // Ghostty's sources and Wisp's patches are stored with LF endings. A
+    // Windows Git installation commonly enables core.autocrlf, which would
+    // otherwise check the pinned sources out as CRLF and make every patch fail.
+    let mut config = Command::new("git");
+    config
+        .args(["config", "core.autocrlf", "false"])
+        .current_dir(source);
+    run(config, "configure Ghostty source line endings");
     let paths = previous
         .lines()
         .chain(combined.lines())
@@ -404,6 +421,7 @@ fn apply_native_patches(source: &Path) {
         let mut apply = Command::new("git");
         apply
             .arg("apply")
+            .arg("--ignore-whitespace")
             .arg(directory.join(name))
             .current_dir(source);
         run(apply, "apply Ghostty native patch");
@@ -435,6 +453,8 @@ fn fetch_ghostty(out_dir: &Path) -> PathBuf {
 
     let mut clone = Command::new("git");
     clone
+        .arg("-c")
+        .arg("core.autocrlf=false")
         .arg("clone")
         .arg("--filter=blob:none")
         .arg("--no-checkout")
@@ -444,6 +464,8 @@ fn fetch_ghostty(out_dir: &Path) -> PathBuf {
 
     let mut checkout = Command::new("git");
     checkout
+        .arg("-c")
+        .arg("core.autocrlf=false")
         .arg("checkout")
         .arg(GHOSTTY_COMMIT)
         .current_dir(&src_dir);

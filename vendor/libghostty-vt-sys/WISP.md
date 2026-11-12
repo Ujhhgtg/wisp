@@ -10,6 +10,17 @@ The native Ghostty source stays pinned to
 build script. Wisp changes only:
 
 - Cargo file-change tracking uses the local paths.
+- Fetched Ghostty sources are checked out with LF endings and patches are
+  applied whitespace-tolerantly, so vendored builds work when Windows Git has
+  `core.autocrlf` enabled.
+- Windows builds use Ghostty's scalar path by default because Zig 0.15.2's
+  Clang cannot compile the SIMD C++ dependencies against current Visual Studio
+  standard libraries. Set `LIBGHOSTTY_VT_SYS_SIMD=1` to opt in when the
+  toolchain supports it.
+- `selection-gesture-windows-time.patch` converts caller-provided nanoseconds
+  to Windows QueryPerformanceCounter ticks. Without the conversion, click
+  times were interpreted as QPC ticks and double/triple-click selection
+  intervals were roughly ten seconds instead of the configured 500 ms.
 - Optimized Cargo profiles select Zig ReleaseFast/ReleaseSmall even when
   Rust debug symbols are enabled. `LIBGHOSTTY_VT_SYS_OPTIMIZE` remains an
   explicit override; unoptimized debug builds still select Zig Debug.

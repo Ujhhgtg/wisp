@@ -1,0 +1,17 @@
+diff --git a/src/terminal/c/selection_gesture.zig b/src/terminal/c/selection_gesture.zig
+index cc56da3c0..fdda08e5f 100644
+--- a/src/terminal/c/selection_gesture.zig
++++ b/src/terminal/c/selection_gesture.zig
+@@ -746,7 +746,11 @@ fn instantFromNs(ns: u64) SelectionGesture.Time {
+     }
+ 
+     return switch (builtin.os.tag) {
+-        .windows, .uefi, .wasi => .{ .timestamp = ns },
++        .windows => .{ .timestamp = @intCast(
++            (@as(u128, ns) * std.os.windows.QueryPerformanceFrequency()) /
++                std.time.ns_per_s,
++        ) },
++        .uefi, .wasi => .{ .timestamp = ns },
+         else => .{ .timestamp = .{
+             .sec = @intCast(ns / std.time.ns_per_s),
+             .nsec = @intCast(ns % std.time.ns_per_s),

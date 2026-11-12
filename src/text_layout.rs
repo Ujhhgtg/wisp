@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::ops::Range;
+#[cfg(unix)]
 use std::process::Command;
 
 use glyphon::cosmic_text::{FeatureTag, FontFeatures};
@@ -17,6 +18,8 @@ pub(super) struct CellMetrics {
     pub height: u32,
     pub baseline: f32,
     pub font_size: f32,
+    pub underline_position: u32,
+    pub underline_thickness: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -390,18 +393,21 @@ fn resolve_family(font_system: &mut FontSystem, requested: &str) -> Result<Strin
     {
         return Ok(family);
     }
-    if let Ok(output) = Command::new("fc-match")
-        .args(["--format", "%{family[0]}", requested])
-        .output()
-        && output.status.success()
+    #[cfg(unix)]
     {
-        let matched = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        if font_system
-            .db()
-            .faces()
-            .any(|face| face.families.iter().any(|(family, _)| *family == matched))
+        if let Ok(output) = Command::new("fc-match")
+            .args(["--format", "%{family[0]}", requested])
+            .output()
+            && output.status.success()
         {
-            return Ok(matched);
+            let matched = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if font_system
+                .db()
+                .faces()
+                .any(|face| face.families.iter().any(|(family, _)| *family == matched))
+            {
+                return Ok(matched);
+            }
         }
     }
     let fallback = font_system
@@ -438,11 +444,29 @@ fn measure_font(
     let leading = (metrics.leading * scale).max(0.0);
     let height = (ascent + descent + leading).ceil().max(1.0) as u32;
     let baseline = ((height as f32 - ascent - descent) * 0.5 + ascent).round();
+    let (underline_position, underline_thickness) = metrics.underline.map_or_else(
+        || {
+            (
+                (baseline + 1.0).min(height.saturating_sub(1) as f32) as u32,
+                (font_size / 14.0).round().max(1.0) as u32,
+            )
+        },
+        |underline| {
+            (
+                (baseline - underline.offset * scale)
+                    .ceil()
+                    .clamp(0.0, height.saturating_sub(1) as f32) as u32,
+                (underline.thickness * scale).ceil().max(1.0) as u32,
+            )
+        },
+    );
     Ok(CellMetrics {
         width,
         height,
         baseline,
         font_size,
+        underline_position,
+        underline_thickness,
     })
 }
 
@@ -492,9 +516,19 @@ mod tests {
     #[test]
     fn installed_family_and_actual_advance_are_used() {
         let mut config = Config::default();
-        config.font.family = "DejaVu Sans Mono".to_owned();
+        let family = {
+            let font_system = FontSystem::new();
+            font_system
+                .db()
+                .faces()
+                .find(|face| face.monospaced)
+                .and_then(|face| face.families.first())
+                .map(|(family, _)| family.clone())
+                .expect("an installed monospace family")
+        };
+        config.font.family = family.clone();
         let layout = TextLayout::new(&config, 1.0).expect("font should load");
-        assert_eq!(layout.family, "DejaVu Sans Mono");
+        assert_eq!(layout.family, family);
         let mut probe = Buffer::new_empty(Metrics::new(
             layout.metrics.font_size,
             layout.metrics.height as f32,

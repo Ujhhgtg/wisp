@@ -1,4 +1,5 @@
 scrollback_limit = 100000
+shell = "/bin/zsh"
 
 [font]
 family = "monospace"

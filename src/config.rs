@@ -521,6 +521,8 @@ impl Default for Colors {
 pub struct Config {
     #[serde(deserialize_with = "deserialize_scrollback_limit")]
     pub scrollback_limit: i64,
+    #[serde(default, deserialize_with = "deserialize_shell")]
+    pub shell: Option<PathBuf>,
     pub font: FontConfig,
     pub window: WindowConfig,
     pub colors: Colors,
@@ -533,6 +535,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             scrollback_limit: 100_000,
+            shell: None,
             font: FontConfig::default(),
             window: WindowConfig::default(),
             colors: Colors::default(),
@@ -572,8 +575,31 @@ impl Config {
                     .to_owned(),
             ));
         }
+        if self.shell.as_ref().is_some_and(|path| {
+            path.as_os_str().is_empty() || path.to_string_lossy().trim().is_empty()
+        }) {
+            return Err(ConfigValidationError(
+                "shell must be a non-empty executable path".to_owned(),
+            ));
+        }
         self.window.margin_width.validate()
     }
+}
+
+fn deserialize_shell<'de, D>(deserializer: D) -> Result<Option<PathBuf>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let path = Option::<PathBuf>::deserialize(deserializer)?;
+    if path
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty() || path.to_string_lossy().trim().is_empty())
+    {
+        return Err(D::Error::custom(
+            "shell must be a non-empty executable path",
+        ));
+    }
+    Ok(path)
 }
 
 fn deserialize_font_family<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -663,14 +689,37 @@ pub fn load() -> Result<Config, ConfigError> {
 
 pub fn config_candidates() -> Vec<PathBuf> {
     let current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    config_candidates_from(
+    #[cfg(windows)]
+    return windows_config_candidates(env::var_os("USERPROFILE"), &current_dir);
+    #[cfg(not(windows))]
+    config_candidates_unix(
         env::var_os("XDG_CONFIG_HOME"),
         env::var_os("HOME"),
         &current_dir,
     )
 }
 
-fn config_candidates_from(
+#[cfg(windows)]
+fn windows_config_candidates(
+    userprofile: Option<std::ffi::OsString>,
+    current_dir: &Path,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::with_capacity(2);
+    if let Some(userprofile) = non_empty_path(userprofile) {
+        push_unique(
+            &mut candidates,
+            userprofile.join(".config").join(CONFIG_RELATIVE_PATH),
+        );
+    }
+    push_unique(
+        &mut candidates,
+        current_dir.join(PROJECT_CONFIG_RELATIVE_PATH),
+    );
+    candidates
+}
+
+#[cfg(not(windows))]
+fn config_candidates_unix(
     xdg_config_home: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
     current_dir: &Path,
@@ -713,6 +762,7 @@ mod tests {
         let config = Config::default();
 
         assert_eq!(config.scrollback_limit, 100_000);
+        assert_eq!(config.shell, None);
         assert_eq!(config.font.family, "monospace");
         assert_eq!(config.font.size, 11.0);
         assert_eq!(config.window.margin_width, Margins::uniform(21.75));
@@ -777,8 +827,17 @@ kitty_graphics = false
     }
 
     #[test]
-    fn config_candidates_follow_requested_precedence() {
-        let candidates = config_candidates_from(
+    fn parses_optional_shell_override_and_rejects_empty_paths() {
+        let config: Config = toml::from_str(r#"shell = "/custom/shell""#).unwrap();
+        assert_eq!(config.shell, Some(PathBuf::from("/custom/shell")));
+        assert!(toml::from_str::<Config>("shell = \"\"").is_err());
+        assert!(toml::from_str::<Config>("shell = \"   \"").is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn config_candidates_follow_unix_precedence() {
+        let candidates = config_candidates_unix(
             Some(OsString::from("/xdg")),
             Some(OsString::from("/home/tester")),
             Path::new("/project"),
@@ -787,16 +846,38 @@ kitty_graphics = false
         assert_eq!(
             candidates,
             vec![
-                PathBuf::from("/xdg/wisp/config.toml"),
-                PathBuf::from("/home/tester/.config/wisp/config.toml"),
-                PathBuf::from("/project/.config/wisp/config.toml"),
+                Path::new("/xdg").join(CONFIG_RELATIVE_PATH),
+                Path::new("/home/tester")
+                    .join(".config")
+                    .join(CONFIG_RELATIVE_PATH),
+                Path::new("/project").join(PROJECT_CONFIG_RELATIVE_PATH),
             ]
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn config_candidates_follow_windows_precedence() {
+        let candidates = windows_config_candidates(
+            Some(OsString::from(r"C:\Users\tester")),
+            Path::new(r"C:\project"),
+        );
+
+        assert_eq!(
+            candidates,
+            vec![
+                Path::new(r"C:\Users\tester")
+                    .join(".config")
+                    .join(CONFIG_RELATIVE_PATH),
+                Path::new(r"C:\project").join(PROJECT_CONFIG_RELATIVE_PATH),
+            ]
+        );
+    }
+
+    #[cfg(not(windows))]
     #[test]
     fn empty_xdg_home_is_ignored() {
-        let candidates = config_candidates_from(
+        let candidates = config_candidates_unix(
             Some(OsString::new()),
             Some(OsString::from("/home/tester")),
             Path::new("/project"),
@@ -805,8 +886,10 @@ kitty_graphics = false
         assert_eq!(
             candidates,
             vec![
-                PathBuf::from("/home/tester/.config/wisp/config.toml"),
-                PathBuf::from("/project/.config/wisp/config.toml"),
+                Path::new("/home/tester")
+                    .join(".config")
+                    .join(CONFIG_RELATIVE_PATH),
+                Path::new("/project").join(PROJECT_CONFIG_RELATIVE_PATH),
             ]
         );
     }

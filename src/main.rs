@@ -1,10 +1,14 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use arboard::{Clipboard, GetExtLinux, LinuxClipboardKind, SetExtLinux};
+use arboard::Clipboard;
+#[cfg(target_os = "linux")]
+use arboard::{GetExtLinux, LinuxClipboardKind, SetExtLinux};
 use portable_pty::CommandBuilder;
 use terminal::{Command, Session};
 use winit::application::ApplicationHandler;
@@ -378,10 +382,7 @@ impl WispApp {
                 }
                 terminal::SessionEvent::PrimarySelection(text) => {
                     if let Some(clipboard) = self.clipboard.as_mut()
-                        && let Err(error) = clipboard
-                            .set()
-                            .clipboard(LinuxClipboardKind::Primary)
-                            .text(text)
+                        && let Err(error) = set_primary_selection(clipboard, text)
                     {
                         eprintln!("failed to copy primary selection: {error}");
                     }
@@ -391,10 +392,7 @@ impl WispApp {
                         continue;
                     }
                     if let Some(clipboard) = self.clipboard.as_mut()
-                        && let Ok(text) = clipboard
-                            .get()
-                            .clipboard(LinuxClipboardKind::Primary)
-                            .text()
+                        && let Some(text) = primary_selection(clipboard)
                     {
                         session.send(Command::RequestPaste(text));
                     }
@@ -475,11 +473,17 @@ impl ApplicationHandler<UserEvent> for WispApp {
         let attributes = Window::default_attributes()
             .with_title("Wisp")
             .with_min_inner_size(winit::dpi::PhysicalSize::new(320_u32, 200_u32));
-        let attributes = winit::platform::wayland::WindowAttributesExtWayland::with_name(
-            attributes, "wisp", "wisp",
+        #[cfg(target_os = "linux")]
+        let attributes = {
+            let attributes = winit::platform::wayland::WindowAttributesExtWayland::with_name(
+                attributes, "wisp", "wisp",
+            );
+            winit::platform::x11::WindowAttributesExtX11::with_name(attributes, "wisp", "wisp")
+        };
+        #[cfg(target_os = "windows")]
+        let attributes = winit::platform::windows::WindowAttributesExtWindows::with_class_name(
+            attributes, "wisp",
         );
-        let attributes =
-            winit::platform::x11::WindowAttributesExtX11::with_name(attributes, "wisp", "wisp");
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
@@ -794,6 +798,33 @@ impl ApplicationHandler<UserEvent> for WispApp {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn set_primary_selection(clipboard: &mut Clipboard, text: String) -> Result<(), arboard::Error> {
+    clipboard
+        .set()
+        .clipboard(LinuxClipboardKind::Primary)
+        .text(text)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_primary_selection(_clipboard: &mut Clipboard, _text: String) -> Result<(), arboard::Error> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn primary_selection(clipboard: &mut Clipboard) -> Option<String> {
+    clipboard
+        .get()
+        .clipboard(LinuxClipboardKind::Primary)
+        .text()
+        .ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn primary_selection(_clipboard: &mut Clipboard) -> Option<String> {
+    None
 }
 
 fn map_modifiers(modifiers: ModifiersState) -> libghostty_vt::key::Mods {

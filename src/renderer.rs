@@ -26,6 +26,12 @@ mod text_layout;
 
 use text_layout::TextLayout;
 
+const HYPERLINK_UNDERLINE_COLOR: Rgb = Rgb {
+    red: 0,
+    green: 135,
+    blue: 189,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RenderOutcome {
     Rendered,
@@ -921,25 +927,17 @@ impl Renderer {
         }
         if let Some(hover) = &self.hover {
             for span in &hover.spans {
-                let left = geometry.origin_x + u32::from(span.start) * cell_width;
-                let right = (geometry.origin_x + u32::from(span.end) * cell_width)
-                    .min(geometry.origin_x + geometry.content_width);
-                let top = geometry.origin_y
-                    + u32::from(span.row) * cell_height
-                    + self.layout.metrics.baseline as u32
-                    + 1;
-                for x in left..right {
-                    let phase = (x - left) % 4;
-                    let y = top + u32::from(phase == 1 || phase == 2);
-                    append_rect(
+                let top = geometry.origin_y + u32::from(span.row) * cell_height;
+                for column in span.start..span.end {
+                    append_kitty_curl_underline(
                         &mut self.rect_vertices,
-                        [x as f32, y as f32, 1.0, 1.0],
-                        Rgb {
-                            red: 0,
-                            green: 135,
-                            blue: 189,
-                        },
-                        1.0,
+                        geometry.origin_x + u32::from(column) * cell_width,
+                        top,
+                        cell_width,
+                        cell_height,
+                        self.layout.metrics.underline_position,
+                        self.layout.metrics.underline_thickness,
+                        HYPERLINK_UNDERLINE_COLOR,
                         self.size,
                         self.surface_config.format.is_srgb(),
                     );
@@ -1157,6 +1155,98 @@ fn append_underline(
     }
 }
 
+fn append_kitty_curl_underline(
+    vertices: &mut Vec<RectVertex>,
+    left: u32,
+    top: u32,
+    cell_width: u32,
+    cell_height: u32,
+    underline_position: u32,
+    underline_thickness: u32,
+    color: Rgb,
+    size: PhysicalSize<u32>,
+    srgb: bool,
+) {
+    let cell_width = cell_width.max(1);
+    let cell_height = cell_height.max(1);
+    let max_x = cell_width - 1;
+    let max_y = cell_height - 1;
+    let x_factor = 2.0 * std::f32::consts::PI / max_x.max(1) as f32;
+    let half = underline_thickness / 2;
+    let position =
+        underline_position.min(cell_height.saturating_sub(half + underline_thickness % 2));
+    let thickness = underline_thickness
+        .min(cell_height.saturating_sub(position + 1))
+        .max(1);
+    let max_height = cell_height.saturating_sub(position.saturating_sub(thickness / 2));
+    let half_height = (max_height / 4).max(1);
+    let thickness = thickness.saturating_sub(if thickness < 3 { 1 } else { 2 });
+    let mut position = position + half_height * 2;
+    if position + half_height > max_y {
+        position = max_y.saturating_sub(half_height);
+    }
+
+    let mut coverage = vec![0_u8; (cell_width * cell_height) as usize];
+    for x in 0..cell_width {
+        let y = half_height as f32 * (x as f32 * x_factor).cos();
+        let y1 = (y - thickness as f32).floor() as i32;
+        let y2 = y.ceil() as i32;
+        let intensity = (255.0 * (y - y.floor()).abs()) as u8;
+        add_underline_coverage(
+            &mut coverage,
+            cell_width,
+            x,
+            position,
+            y1,
+            255 - intensity,
+            max_y,
+        );
+        add_underline_coverage(&mut coverage, cell_width, x, position, y2, intensity, max_y);
+        for offset in 1..=thickness {
+            add_underline_coverage(
+                &mut coverage,
+                cell_width,
+                x,
+                position,
+                y1 + offset as i32,
+                255,
+                max_y,
+            );
+        }
+    }
+
+    for y in 0..cell_height {
+        for x in 0..cell_width {
+            let alpha = coverage[(y * cell_width + x) as usize];
+            if alpha == 0 {
+                continue;
+            }
+            append_rect(
+                vertices,
+                [(left + x) as f32, (top + y) as f32, 1.0, 1.0],
+                color,
+                f32::from(alpha) / 255.0,
+                size,
+                srgb,
+            );
+        }
+    }
+}
+
+fn add_underline_coverage(
+    coverage: &mut [u8],
+    cell_width: u32,
+    x: u32,
+    position: u32,
+    y: i32,
+    value: u8,
+    max_y: u32,
+) {
+    let y = (position as i32 + y).clamp(0, max_y as i32) as usize;
+    let index = y * cell_width as usize + x as usize;
+    coverage[index] = coverage[index].saturating_add(value);
+}
+
 fn make_text_atlas(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -1284,6 +1374,7 @@ fn create_rect_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::links::LinkSpan;
     use crate::terminal::{CellSnapshot, CursorSnapshot};
     use std::time::Duration;
 
@@ -1531,6 +1622,51 @@ mod tests {
             origin_x + column,
             origin_y + row
         ) == [255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn hovered_links_use_kitty_sparse_undercurl() {
+        let config = Config::default();
+        let mut renderer = offscreen(config.clone());
+        let frame = snapshot(&config, 4, 1);
+        renderer.set_snapshot(frame);
+        renderer.set_hover(Some(LinkTarget {
+            uri: "https://example.com".to_owned(),
+            spans: vec![LinkSpan {
+                row: 0,
+                start: 0,
+                end: 4,
+            }],
+            explicit: true,
+        }));
+        let rgba = capture(&mut renderer);
+        let (cell_width, cell_height) = renderer.cell_geometry();
+        let (origin_x, origin_y) = renderer.geometry().content_origin();
+        let painted = |column: u32| -> Vec<(u32, u32)> {
+            (0..cell_width)
+                .flat_map(|x| (0..cell_height).map(move |y| (x, y)))
+                .filter(|(x, y)| {
+                    pixel(
+                        &rgba,
+                        renderer.size.width,
+                        origin_x + column * cell_width + x,
+                        origin_y + y,
+                    ) != [0, 0, 0, 255]
+                })
+                .collect()
+        };
+        let reference = painted(0);
+        let rows = reference
+            .iter()
+            .map(|(_, y)| *y)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(rows.len() >= 3);
+        assert!(reference.iter().any(|(x, y)| {
+            pixel(&rgba, renderer.size.width, origin_x + x, origin_y + y) == [0, 135, 189, 255]
+        }));
+        for column in 0..4 {
+            assert_eq!(painted(column), reference);
+        }
     }
 
     #[test]

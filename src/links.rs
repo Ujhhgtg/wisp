@@ -1,11 +1,20 @@
 use std::collections::VecDeque;
+#[cfg(not(windows))]
 use std::process::{Command, Stdio};
+#[cfg(not(windows))]
 use std::thread;
 
 use libghostty_vt::screen::CellWide;
 use libghostty_vt::terminal::{Point, PointCoordinate};
 use libghostty_vt::{Error, Terminal};
 use winit::window::CursorIcon;
+
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use windows_sys::Win32::UI::Shell::ShellExecuteW;
+#[cfg(windows)]
+use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 const URL_PREFIXES: &[&str] = &[
     "file:",
@@ -319,6 +328,7 @@ pub fn pointer_icon(
     })
 }
 
+#[cfg(windows)]
 pub fn open_url(uri: &str) -> std::io::Result<()> {
     if uri.is_empty() || uri.chars().any(char::is_control) || uri.starts_with('-') {
         return Err(std::io::Error::new(
@@ -326,7 +336,44 @@ pub fn open_url(uri: &str) -> std::io::Result<()> {
             "invalid link target",
         ));
     }
-    let mut child = Command::new("xdg-open")
+    let operation = std::ffi::OsStr::new("open")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let target = std::ffi::OsStr::new(uri)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result as isize <= 32 {
+        Err(std::io::Error::from_raw_os_error(result as isize as i32))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+pub fn open_url(uri: &str) -> std::io::Result<()> {
+    if uri.is_empty() || uri.chars().any(char::is_control) || uri.starts_with('-') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid link target",
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(not(target_os = "macos"))]
+    let opener = "xdg-open";
+    let mut child = Command::new(opener)
         .arg(uri)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

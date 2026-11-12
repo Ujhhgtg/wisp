@@ -8,13 +8,11 @@ license = "MIT"
 too_many_arguments = "allow"
 
 [dependencies]
-arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
 bytemuck = { version = "1.23", features = ["derive"] }
 base64 = "0.22"
 flate2 = "1.1"
 glyphon = "0.12"
 libghostty-vt = { version = "0.2.2", features = ["kitty-graphics", "png"] }
-libc = "0.2"
 memchr = "2.8"
 portable-pty = "0.9"
 pollster = "0.4"
@@ -22,13 +20,47 @@ png = "0.18"
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.2"
 unicode-width = "0.2"
-wgpu = { version = "30.0.1", default-features = false, features = ["std", "wgsl", "vulkan", "gles"] }
-winit = { version = "0.30.12", features = ["rwh_06", "x11", "wayland"] }
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "wgsl"] }
+winit = { version = "0.30.12", default-features = false, features = ["rwh_06"] }
 
-[dev-dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
+wgpu = { version = "30.0.1", default-features = false, features = ["vulkan", "gles"] }
+winit = { version = "0.30.12", default-features = false, features = ["x11", "wayland"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+arboard = "3.7"
+wgpu = { version = "30.0.1", default-features = false, features = ["vulkan", "dx12", "gles"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+arboard = "3.7"
+wgpu = { version = "30.0.1", default-features = false, features = ["metal"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wayland-protocols-misc = { version = "0.3", features = ["client"] }
+
+[features]
+wayland-tools = []
+
+[[example]]
+name = "keyboard_driver"
+required-features = ["wayland-tools"]
+
+[[example]]
+name = "pointer_driver"
+required-features = ["wayland-tools"]
 
 [patch.crates-io]
 libghostty-vt = { path = "vendor/libghostty-vt" }

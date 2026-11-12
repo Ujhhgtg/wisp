@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 

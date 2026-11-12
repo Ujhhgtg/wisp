@@ -1,9 +1,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(unix)]
 use std::ffi::{CString, OsStr};
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Seek, SeekFrom};
+#[cfg(unix)]
 use std::os::fd::{FromRawFd, OwnedFd};
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
@@ -886,63 +890,10 @@ fn decode_transport(fields: &Fields, payload: Vec<u8>) -> Result<Vec<u8>, &'stat
             if payload.contains(&0) {
                 return Err("EBADF");
             }
-            let path = PathBuf::from(OsStr::from_bytes(&payload));
-            let mut remove_temporary = None;
-            let mut file = if medium == b's' {
-                let name = CString::new(payload).map_err(|_| "EBADF")?;
-                let descriptor = unsafe {
-                    libc::shm_open(
-                        name.as_ptr(),
-                        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK,
-                        0,
-                    )
-                };
-                if descriptor < 0 {
-                    return Err("EBADF");
-                }
-                let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
-                unsafe {
-                    libc::shm_unlink(name.as_ptr());
-                }
-                File::from(descriptor)
+            let (mut file, remove_temporary) = if medium == b's' {
+                (open_shared_memory(&payload)?, None)
             } else {
-                let resolved = path.canonicalize().map_err(|_| "EBADF")?;
-                if ["/proc", "/sys", "/dev"]
-                    .iter()
-                    .any(|prefix| resolved.starts_with(prefix))
-                    && !resolved.starts_with("/dev/shm")
-                {
-                    return Err("EBADF");
-                }
-                if !fs::metadata(&resolved).map_err(|_| "EBADF")?.is_file() {
-                    return Err("EBADF");
-                }
-                let file = File::options()
-                    .read(true)
-                    .custom_flags(libc::O_NONBLOCK)
-                    .open(&resolved)
-                    .map_err(|_| "EBADF")?;
-                let temporary = medium == b't'
-                    && resolved
-                        .as_os_str()
-                        .as_bytes()
-                        .windows(b"tty-graphics-protocol".len())
-                        .any(|part| part == b"tty-graphics-protocol")
-                    && [
-                        PathBuf::from("/tmp"),
-                        PathBuf::from("/dev/shm"),
-                        std::env::temp_dir(),
-                    ]
-                    .iter()
-                    .any(|directory| {
-                        directory
-                            .canonicalize()
-                            .is_ok_and(|directory| resolved.starts_with(directory))
-                    });
-                if temporary {
-                    remove_temporary = Some(resolved);
-                }
-                file
+                open_local_file(medium, &payload)?
             };
             let read = || -> Result<Vec<u8>, &'static str> {
                 if !file.metadata().map_err(|_| "EBADF")?.is_file() {
@@ -1008,6 +959,89 @@ fn decode_transport(fields: &Fields, payload: Vec<u8>) -> Result<Vec<u8>, &'stat
         }
         _ => Err("EINVAL"),
     }
+}
+
+#[cfg(unix)]
+fn open_shared_memory(payload: &[u8]) -> Result<File, &'static str> {
+    let name = CString::new(payload).map_err(|_| "EBADF")?;
+    let descriptor = unsafe {
+        libc::shm_open(
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0,
+        )
+    };
+    if descriptor < 0 {
+        return Err("EBADF");
+    }
+    let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    unsafe {
+        libc::shm_unlink(name.as_ptr());
+    }
+    Ok(File::from(descriptor))
+}
+
+#[cfg(not(unix))]
+fn open_shared_memory(_payload: &[u8]) -> Result<File, &'static str> {
+    Err("EBADF")
+}
+
+fn open_local_file(medium: u8, payload: &[u8]) -> Result<(File, Option<PathBuf>), &'static str> {
+    let path = transport_path(payload)?;
+    let resolved = path.canonicalize().map_err(|_| "EBADF")?;
+    #[cfg(unix)]
+    if ["/proc", "/sys", "/dev"]
+        .iter()
+        .any(|prefix| resolved.starts_with(prefix))
+        && !resolved.starts_with("/dev/shm")
+    {
+        return Err("EBADF");
+    }
+    if !fs::metadata(&resolved).map_err(|_| "EBADF")?.is_file() {
+        return Err("EBADF");
+    }
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+    let file = options.open(&resolved).map_err(|_| "EBADF")?;
+    let temporary = medium == b't'
+        && resolved
+            .as_os_str()
+            .as_encoded_bytes()
+            .windows(b"tty-graphics-protocol".len())
+            .any(|part| part == b"tty-graphics-protocol")
+        && temporary_directories().iter().any(|directory| {
+            directory
+                .canonicalize()
+                .is_ok_and(|directory| resolved.starts_with(directory))
+        });
+    Ok((file, temporary.then_some(resolved)))
+}
+
+#[cfg(unix)]
+fn transport_path(payload: &[u8]) -> Result<PathBuf, &'static str> {
+    Ok(PathBuf::from(OsStr::from_bytes(payload)))
+}
+
+#[cfg(not(unix))]
+fn transport_path(payload: &[u8]) -> Result<PathBuf, &'static str> {
+    let path = std::str::from_utf8(payload).map_err(|_| "EBADF")?;
+    Ok(PathBuf::from(path))
+}
+
+#[cfg(unix)]
+fn temporary_directories() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from("/tmp"),
+        PathBuf::from("/dev/shm"),
+        std::env::temp_dir(),
+    ]
+}
+
+#[cfg(not(unix))]
+fn temporary_directories() -> Vec<PathBuf> {
+    vec![std::env::temp_dir()]
 }
 
 fn palette(terminal: &Terminal<'_, '_>, config: &Config) -> Result<Vec<[u8; 4]>, Error> {
@@ -1540,6 +1574,33 @@ mod tests {
             .set_visible(&terminal, &HashSet::from([7]))
             .unwrap();
         assert!(protocol.deadline(&terminal).is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_transport_reads_and_cleans_up_temporary_images() {
+        let directory = std::env::temp_dir().join(format!(
+            "wisp-graphics-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("tty-graphics-protocol-test.bin");
+        fs::write(&path, [1_u8, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let fields = Fields::parse(b"t=t,f=32,s=2,v=1").unwrap();
+        let data = decode_transport(&fields, path.to_string_lossy().as_bytes().to_vec()).unwrap();
+        assert_eq!(data, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(!path.exists(), "temporary transport file was not removed");
+        fs::remove_dir_all(directory).unwrap();
+
+        let shared = Fields::parse(b"t=s,f=32,s=1,v=1").unwrap();
+        assert_eq!(
+            decode_transport(&shared, b"/wisp-test".to_vec()),
+            Err("EBADF")
+        );
     }
 
     #[test]

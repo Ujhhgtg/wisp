@@ -1,16 +1,23 @@
 use std::cell::RefCell;
+#[cfg(unix)]
 use std::io::Write;
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+#[cfg(unix)]
 use std::thread;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use libghostty_vt::{Terminal, TerminalOptions};
+#[cfg(unix)]
 use portable_pty::CommandBuilder;
 use wisp::config::Config;
 use wisp::graphics::ImageLayer;
-use wisp::terminal::{Command, Session, SessionEvent, SnapshotBuilder, apply_theme};
+#[cfg(unix)]
+use wisp::terminal::{Command, Session, SessionEvent};
+use wisp::terminal::{SnapshotBuilder, apply_theme};
 
 fn terminal() -> (Terminal<'static, 'static>, Config, SnapshotBuilder) {
     let config = Config::default();
@@ -326,6 +333,7 @@ fn image_layers_follow_the_kitty_z_threshold() {
 }
 
 #[test]
+#[cfg(unix)]
 fn kitten_icat_auto_stream_file_and_shared_memory_display_real_image() {
     let available = std::process::Command::new("kitten")
         .arg("--version")
@@ -391,6 +399,7 @@ fn kitten_icat_auto_stream_file_and_shared_memory_display_real_image() {
     std::fs::remove_dir(directory).unwrap();
 }
 
+#[cfg(unix)]
 fn wait_title(session: &Session, prefix: &str, timeout: Duration) -> String {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {

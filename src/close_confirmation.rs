@@ -1,12 +1,28 @@
+#[cfg(target_os = "linux")]
 use std::fs;
 use std::io;
 use std::path::Path;
 
+#[cfg(windows)]
+use std::os::windows::ffi::OsStringExt;
+#[cfg(windows)]
+use std::path::PathBuf;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use winit::keyboard::{Key, NamedKey};
 
 use crate::config::Config;
 use crate::terminal::{CellSnapshot, CursorSnapshot, Rgb, TerminalSnapshot};
+
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+#[cfg(windows)]
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Choice {
@@ -404,6 +420,24 @@ pub fn sanitized_paste(text: &str, bracketed: bool) -> Option<String> {
 }
 
 pub fn needs_confirmation(pid: Option<u32>, explicit_command: bool) -> io::Result<bool> {
+    needs_confirmation_for_shell(pid, explicit_command, None)
+}
+
+pub fn needs_confirmation_for_shell(
+    pid: Option<u32>,
+    explicit_command: bool,
+    shell: Option<&std::ffi::OsStr>,
+) -> io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    return needs_confirmation_linux(pid, explicit_command);
+    #[cfg(windows)]
+    return needs_confirmation_windows(pid, explicit_command, shell);
+    #[cfg(not(any(target_os = "linux", windows)))]
+    return Ok(pid.is_some() && explicit_command);
+}
+
+#[cfg(target_os = "linux")]
+fn needs_confirmation_linux(pid: Option<u32>, explicit_command: bool) -> io::Result<bool> {
     let Some(pid) = pid else {
         return Ok(true);
     };
@@ -449,6 +483,31 @@ pub fn needs_confirmation(pid: Option<u32>, explicit_command: bool) -> io::Resul
     Ok(false)
 }
 
+#[cfg(windows)]
+fn needs_confirmation_windows(
+    pid: Option<u32>,
+    explicit_command: bool,
+    shell: Option<&std::ffi::OsStr>,
+) -> io::Result<bool> {
+    let Some(pid) = pid else {
+        return Ok(true);
+    };
+    if explicit_command {
+        let processes = windows_processes()?;
+        if !processes.iter().any(|process| process.pid == pid) {
+            return Ok(false);
+        }
+        return Ok(true);
+    }
+    let processes = windows_processes()?;
+    if !processes.iter().any(|process| process.pid == pid) {
+        return Ok(false);
+    }
+    let root = effective_shell_root(&processes, pid, shell);
+    Ok(!descendants(&processes, root).is_empty())
+}
+
+#[cfg(target_os = "linux")]
 pub fn shell_was_replaced(pid: Option<u32>, executable: &Path) -> io::Result<bool> {
     let Some(pid) = pid else {
         return Ok(true);
@@ -460,7 +519,37 @@ pub fn shell_was_replaced(pid: Option<u32>, executable: &Path) -> io::Result<boo
     }
 }
 
+#[cfg(windows)]
+pub fn shell_was_replaced(pid: Option<u32>, executable: &Path) -> io::Result<bool> {
+    let Some(pid) = pid else {
+        return Ok(true);
+    };
+    let Some(current) = process_executable(pid)? else {
+        return Ok(false);
+    };
+    Ok(normalized_windows_path(&current) != normalized_windows_path(executable))
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+pub fn shell_was_replaced(_pid: Option<u32>, _executable: &Path) -> io::Result<bool> {
+    Ok(false)
+}
+
 pub fn close_message(pid: Option<u32>) -> String {
+    close_message_for_shell(pid, None)
+}
+
+pub fn close_message_for_shell(pid: Option<u32>, shell: Option<&std::ffi::OsStr>) -> String {
+    #[cfg(target_os = "linux")]
+    return close_message_linux(pid);
+    #[cfg(windows)]
+    return close_message_windows(pid, shell);
+    #[cfg(not(any(target_os = "linux", windows)))]
+    return "Are you sure you want to close this window? It is running: a program.".to_owned();
+}
+
+#[cfg(target_os = "linux")]
+fn close_message_linux(pid: Option<u32>) -> String {
     let program = pid
         .and_then(|pid| {
             let children = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).ok()?;
@@ -482,6 +571,168 @@ pub fn close_message(pid: Option<u32>) -> String {
     format!("Are you sure you want to close this window? It is running: {program}.")
 }
 
+#[cfg(windows)]
+fn close_message_windows(pid: Option<u32>, shell: Option<&std::ffi::OsStr>) -> String {
+    let program = pid
+        .and_then(|pid| {
+            let processes = windows_processes().ok()?;
+            let root = effective_shell_root(&processes, pid, shell);
+            let process = descendants(&processes, root)
+                .into_iter()
+                .next()
+                .or_else(|| processes.into_iter().find(|process| process.pid == pid))?;
+            Some(process.executable.to_string_lossy().into_owned())
+        })
+        .filter(|program| !program.is_empty())
+        .unwrap_or_else(|| "a program".to_owned());
+    format!("Are you sure you want to close this window? It is running: {program}.")
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct WindowsProcess {
+    pid: u32,
+    parent: u32,
+    executable: std::ffi::OsString,
+}
+
+#[cfg(windows)]
+struct OwnedHandle(HANDLE);
+
+#[cfg(windows)]
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_processes() -> io::Result<Vec<WindowsProcess>> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let snapshot = OwnedHandle(snapshot);
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    if unsafe { Process32FirstW(snapshot.0, &mut entry) } == 0 {
+        return Ok(Vec::new());
+    }
+    let mut processes = Vec::new();
+    loop {
+        let length = entry
+            .szExeFile
+            .iter()
+            .position(|character| *character == 0)
+            .unwrap_or(entry.szExeFile.len());
+        processes.push(WindowsProcess {
+            pid: entry.th32ProcessID,
+            parent: entry.th32ParentProcessID,
+            executable: std::ffi::OsString::from_wide(&entry.szExeFile[..length]),
+        });
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if unsafe { Process32NextW(snapshot.0, &mut entry) } == 0 {
+            break;
+        }
+    }
+    Ok(processes)
+}
+
+#[cfg(windows)]
+fn descendants(processes: &[WindowsProcess], pid: u32) -> Vec<WindowsProcess> {
+    let mut result: Vec<WindowsProcess> = Vec::new();
+    let mut parents = vec![pid];
+    while let Some(parent) = parents.pop() {
+        for process in processes.iter().filter(|process| process.parent == parent) {
+            if process.pid == pid || result.iter().any(|known| known.pid == process.pid) {
+                continue;
+            }
+            parents.push(process.pid);
+            result.push(process.clone());
+        }
+    }
+    result
+}
+
+#[cfg(windows)]
+fn effective_shell_root(
+    processes: &[WindowsProcess],
+    pid: u32,
+    shell: Option<&std::ffi::OsStr>,
+) -> u32 {
+    let Some(shell_name) = shell.and_then(program_name) else {
+        return pid;
+    };
+    let mut root = pid;
+    for _ in 0..8 {
+        let mut children = processes.iter().filter(|process| process.parent == root);
+        let Some(child) = children.next() else {
+            break;
+        };
+        if children.next().is_some()
+            || program_name(&child.executable).as_deref() != Some(&shell_name)
+        {
+            break;
+        }
+        root = child.pid;
+    }
+    root
+}
+
+#[cfg(windows)]
+fn program_name(program: &std::ffi::OsStr) -> Option<String> {
+    Path::new(program)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .map(str::to_ascii_lowercase)
+}
+
+#[cfg(windows)]
+fn process_executable(pid: u32) -> io::Result<Option<PathBuf>> {
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(87) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    let handle = OwnedHandle(handle);
+    let mut buffer = vec![0_u16; 32 * 1024];
+    let mut length = buffer.len() as u32;
+    if unsafe {
+        QueryFullProcessImageNameW(
+            handle.0,
+            PROCESS_NAME_WIN32,
+            buffer.as_mut_ptr(),
+            &mut length,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    buffer.truncate(length as usize);
+    Ok(Some(PathBuf::from(std::ffi::OsString::from_wide(&buffer))))
+}
+
+#[cfg(windows)]
+fn normalized_windows_path(path: &Path) -> String {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let text = canonical.to_string_lossy();
+    let text = text
+        .strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{rest}"))
+        .or_else(|| text.strip_prefix(r"\\?\").map(str::to_owned))
+        .unwrap_or_else(|| text.into_owned());
+    text.replace('/', r"\").to_lowercase()
+}
+
+#[cfg(target_os = "linux")]
 fn parse_process(stat: &str) -> Option<(char, u32)> {
     let (_, rest) = stat.rsplit_once(')')?;
     let mut fields = rest.split_whitespace();
@@ -530,6 +781,7 @@ mod tests {
         assert_eq!(sanitized_paste("\x7f", false), Some("\u{247f}".to_owned()));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn process_names_with_parentheses_do_not_confuse_status_parsing() {
         assert_eq!(
@@ -537,5 +789,38 @@ mod tests {
             Some(('S', 42))
         );
         assert_eq!(parse_process("bad input"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wrapper_shell_chain_collapses_to_the_real_shell_process() {
+        let processes = vec![
+            WindowsProcess {
+                pid: 10,
+                parent: 1,
+                executable: "nu.exe".into(),
+            },
+            WindowsProcess {
+                pid: 20,
+                parent: 10,
+                executable: "nu.exe".into(),
+            },
+            WindowsProcess {
+                pid: 30,
+                parent: 20,
+                executable: "ping.exe".into(),
+            },
+        ];
+        assert_eq!(
+            effective_shell_root(&processes, 10, Some(std::ffi::OsStr::new("nu"))),
+            20
+        );
+        assert_eq!(
+            descendants(&processes, 20)
+                .into_iter()
+                .map(|process| process.pid)
+                .collect::<Vec<_>>(),
+            [30]
+        );
     }
 }

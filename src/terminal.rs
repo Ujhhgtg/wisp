@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::env;
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -375,7 +376,9 @@ pub enum Command {
 pub struct Session {
     child_pid: Option<u32>,
     explicit_command: bool,
+    shell_program: Option<OsString>,
     shell_executable: Option<std::path::PathBuf>,
+    nushell_autoload: Option<std::path::PathBuf>,
     command_tx: SyncSender<Command>,
     snapshot_slot: Arc<Mutex<Option<TerminalSnapshot>>>,
     event_rx: Receiver<SessionEvent>,
@@ -419,15 +422,8 @@ impl Session {
         cols: u16,
         rows: u16,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
-        Self::spawn_inner(
-            config,
-            cols,
-            rows,
-            CommandBuilder::new(shell),
-            Arc::new(|| {}),
-            false,
-        )
+        let command = default_shell_command(&config);
+        Self::spawn_inner(config, cols, rows, command, Arc::new(|| {}), false)
     }
 
     pub fn spawn_with_waker(
@@ -436,8 +432,8 @@ impl Session {
         rows: u16,
         wake: SessionWake,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
-        Self::spawn_inner(config, cols, rows, CommandBuilder::new(shell), wake, false)
+        let command = default_shell_command(&config);
+        Self::spawn_inner(config, cols, rows, command, wake, false)
     }
 
     pub fn spawn_command(
@@ -476,6 +472,10 @@ impl Session {
         })?;
 
         crate::terminfo::configure_environment(&mut command);
+        #[cfg(windows)]
+        let nushell_autoload = crate::terminfo::configure_nushell_autoload(&mut command)?;
+        #[cfg(not(windows))]
+        let nushell_autoload = None;
         let shell_executable = if explicit_command {
             None
         } else {
@@ -483,6 +483,11 @@ impl Session {
                 .get_argv()
                 .first()
                 .and_then(|program| std::fs::canonicalize(program).ok())
+        };
+        let shell_program = if explicit_command {
+            None
+        } else {
+            command.get_argv().first().cloned()
         };
         let mut child = pair.slave.spawn_command(command)?;
         let child_pid = child.process_id();
@@ -530,7 +535,9 @@ impl Session {
         Ok(Self {
             child_pid,
             explicit_command,
+            shell_program,
             shell_executable,
+            nushell_autoload,
             command_tx,
             snapshot_slot,
             event_rx,
@@ -551,7 +558,11 @@ impl Session {
     }
 
     pub fn needs_close_confirmation(&self) -> std::io::Result<bool> {
-        if crate::close_confirmation::needs_confirmation(self.child_pid, self.explicit_command)? {
+        if crate::close_confirmation::needs_confirmation_for_shell(
+            self.child_pid,
+            self.explicit_command,
+            self.shell_program.as_deref(),
+        )? {
             return Ok(true);
         }
         if let Some(executable) = &self.shell_executable {
@@ -561,8 +572,37 @@ impl Session {
     }
 
     pub fn close_message(&self) -> String {
-        crate::close_confirmation::close_message(self.child_pid)
+        crate::close_confirmation::close_message_for_shell(
+            self.child_pid,
+            self.shell_program.as_deref(),
+        )
     }
+}
+
+fn default_shell_command(config: &Config) -> CommandBuilder {
+    CommandBuilder::new(default_shell(config))
+}
+
+fn default_shell(config: &Config) -> OsString {
+    config
+        .shell
+        .as_ref()
+        .map(|path| path.as_os_str().to_owned())
+        .unwrap_or_else(environment_shell)
+}
+
+#[cfg(windows)]
+fn environment_shell() -> OsString {
+    env::var_os("COMSPEC")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| OsString::from("cmd.exe"))
+}
+
+#[cfg(not(windows))]
+fn environment_shell() -> OsString {
+    env::var_os("SHELL")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| OsString::from("/bin/sh"))
 }
 
 impl Drop for Session {
@@ -570,6 +610,10 @@ impl Drop for Session {
         let _ = self.command_tx.send(Command::Shutdown);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
+        }
+        #[cfg(windows)]
+        if let Some(directory) = self.nushell_autoload.take() {
+            crate::terminfo::remove_nushell_autoload(&directory);
         }
     }
 }
@@ -618,6 +662,8 @@ fn run_terminal(
         cell_height: 18,
     });
     let last_bell = Cell::new(Instant::now() - Duration::from_millis(100));
+    #[cfg(windows)]
+    let mut child_exit_deadline = None;
     let mut terminal = Terminal::new(TerminalOptions {
         cols,
         rows,
@@ -797,7 +843,7 @@ fn run_terminal(
             padding_right: padding.2,
             padding_left: padding.0,
         };
-        let deadline = [
+        let mut deadline = [
             snapshot_pending.get().then(|| {
                 synchronized_until
                     .get()
@@ -810,6 +856,11 @@ fn run_terminal(
         .into_iter()
         .flatten()
         .min();
+        #[cfg(windows)]
+        {
+            let child_poll = Instant::now() + Duration::from_millis(20);
+            deadline = Some(deadline.map_or(child_poll, |deadline| deadline.min(child_poll)));
+        }
         let command = match deadline {
             Some(deadline) => {
                 command_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -820,6 +871,10 @@ fn run_terminal(
         };
         match command {
             Ok(Command::Output(data)) => {
+                #[cfg(windows)]
+                if child_exit_deadline.is_some() {
+                    child_exit_deadline = Some(Instant::now() + Duration::from_millis(100));
+                }
                 crate::diagnostics::trace("pty-output");
                 graphics_capture
                     .borrow_mut()
@@ -1153,6 +1208,17 @@ fn run_terminal(
                 break;
             }
             Err(RecvTimeoutError::Timeout) => {
+                #[cfg(windows)]
+                if child.try_wait()?.is_some() {
+                    let now = Instant::now();
+                    match child_exit_deadline {
+                        Some(deadline) if now >= deadline => break,
+                        Some(_) => {}
+                        None => {
+                            child_exit_deadline = Some(now + Duration::from_millis(250));
+                        }
+                    }
+                }
                 if let Some(uri) = input.poll_link() {
                     let _ = event_tx.send(SessionEvent::OpenUrl(uri));
                 }
@@ -1401,5 +1467,15 @@ mod tests {
             .encode_to_vec(&event, &mut encoded)
             .expect("key event should encode");
         assert_eq!(encoded, b"a");
+    }
+
+    #[test]
+    fn configured_shell_overrides_the_environment_default() {
+        let mut config = Config::default();
+        config.shell = Some(std::path::PathBuf::from("C:\\custom\\shell.exe"));
+        assert_eq!(
+            default_shell(&config),
+            OsString::from("C:\\custom\\shell.exe")
+        );
     }
 }

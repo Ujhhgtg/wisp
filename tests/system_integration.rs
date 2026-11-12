@@ -1,10 +1,14 @@
+#[cfg(unix)]
 use std::thread;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use libghostty_vt::{Terminal, TerminalOptions, key, mouse};
+#[cfg(unix)]
 use portable_pty::CommandBuilder;
 use wisp::config::Config;
 use wisp::input::{InputState, PointerEvent};
+#[cfg(unix)]
 use wisp::terminal::{Command, Session, SessionEvent};
 
 fn terminal() -> Terminal<'static, 'static> {
@@ -504,6 +508,7 @@ fn extra_mouse_buttons_keep_drag_tracking_until_their_release() {
     assert!(mouse_bytes(&mut state, &mut terminal, mouse::Action::Motion, None).is_empty());
 }
 
+#[cfg(unix)]
 fn wait_title(session: &Session, prefix: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -521,6 +526,7 @@ fn wait_title(session: &Session, prefix: &str) -> String {
 }
 
 #[test]
+#[cfg(unix)]
 fn child_process_has_resolvable_terminfo_identity_and_correct_resized_pty_dimensions() {
     let probe = r#"
 import array, curses, fcntl, os, termios, tty
@@ -566,6 +572,7 @@ while os.read(0, 1) != b'\x04': pass
 }
 
 #[test]
+#[cfg(unix)]
 fn control_i_completes_a_filename_in_a_real_bash_readline_session() {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

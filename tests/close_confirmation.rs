@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use std::io::{Read, Write};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
